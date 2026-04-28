@@ -1,0 +1,191 @@
+---
+title: "Middleware in Salvo: handlers as middleware"
+description: "Learn how Salvo unifies middleware and handlers — use .hoop() to add middleware to routes, chain multiple handlers, and control flow."
+---
+
+In Salvo, middleware is not a separate concept. Every middleware is simply a `Handler` that calls `ctrl.call_next()` to pass control to the next handler in the chain, or calls `ctrl.skip_rest()` to stop processing. This unification means there is only one trait to learn and one set of rules for both middleware and terminal handlers.
+
+## Adding middleware with `.hoop()`
+
+Call `.hoop()` on a `Router` to attach a handler as middleware. The middleware runs for every request that matches the router or any of its children:
+
+```rust
+use salvo::http::header::{self, HeaderValue};
+use salvo::prelude::*;
+
+#[handler]
+async fn hello() -> &'static str {
+    "Hello World"
+}
+
+#[handler]
+async fn add_header(res: &mut Response) {
+    res.headers_mut()
+        .insert(header::SERVER, HeaderValue::from_static("Salvo"));
+}
+
+#[tokio::main]
+async fn main() {
+    // add_header runs before hello for every GET /
+    let router = Router::new().hoop(add_header).get(hello);
+
+    let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
+    Server::new(acceptor).serve(router).await;
+}
+```
+
+`.hoop()` is additive — call it multiple times to chain middleware. Middleware runs in the order it was added:
+
+```rust
+let router = Router::new()
+    .hoop(log_request)
+    .hoop(authenticate)
+    .hoop(rate_limit)
+    .get(handler);
+```
+
+## How `FlowCtrl` controls execution
+
+When Salvo matches a request, it collects all middleware from the matched router's ancestors plus the terminal handler into an ordered list. `FlowCtrl` is a cursor over that list.
+
+A middleware that wants to run code both before and after the downstream handlers uses `ctrl.call_next()`:
+
+```rust
+use salvo::prelude::*;
+
+#[handler]
+async fn timer(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+    ctrl: &mut FlowCtrl,
+) {
+    let start = std::time::Instant::now();
+
+    // Run all handlers downstream
+    ctrl.call_next(req, depot, res).await;
+
+    // Code here runs after the terminal handler has written the response
+    let elapsed = start.elapsed();
+    tracing::info!("request took {:?}", elapsed);
+}
+```
+
+A middleware that wants to short-circuit — for example an auth check that rejects the request — omits the `call_next` call and calls `ctrl.skip_rest()` instead:
+
+```rust
+use salvo::prelude::*;
+
+#[handler]
+async fn authenticate(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+    ctrl: &mut FlowCtrl,
+) {
+    let token: Option<String> = req.header("authorization");
+    if token.is_none() {
+        res.status_code(StatusCode::UNAUTHORIZED);
+        ctrl.skip_rest(); // stop — do not proceed
+    } else {
+        depot.insert("token", token.unwrap());
+        ctrl.call_next(req, depot, res).await;
+    }
+}
+```
+
+<Note>
+When a response is set to a status code that `Response::is_stamped()` returns `true` for (4xx, 5xx, and 3xx codes), Salvo automatically skips remaining handlers even if `skip_rest()` was not called explicitly. Catchers are an exception — they can opt in to running despite a stamped response.
+</Note>
+
+## Middleware scopes
+
+`.hoop()` on a parent router applies to that router and all its descendants. Sibling branches are unaffected, which makes it straightforward to apply middleware only to certain sub-trees:
+
+```rust
+use salvo::prelude::*;
+
+#[handler]
+async fn auth_check(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+    ctrl: &mut FlowCtrl,
+) {
+    // authentication logic ...
+    ctrl.call_next(req, depot, res).await;
+}
+
+#[tokio::main]
+async fn main() {
+    let router = Router::new()
+        // Public — no auth
+        .push(Router::with_path("public").get(public_handler))
+        // Private — auth middleware applies to all children
+        .push(
+            Router::with_path("api")
+                .hoop(auth_check)
+                .push(Router::with_path("users").get(list_users))
+                .push(Router::with_path("posts").get(list_posts)),
+        );
+
+    let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
+    Server::new(acceptor).serve(router).await;
+}
+```
+
+You can also create a router that starts with middleware using the `Router::with_hoop` constructor:
+
+```rust
+let api = Router::with_hoop(auth_check)
+    .push(Router::with_path("users").get(list_users));
+```
+
+## Conditional middleware with `.hoop_when()`
+
+`.hoop_when()` accepts a filter closure `Fn(&Request, &Depot) -> bool`. The middleware only runs when the filter returns `true`:
+
+```rust
+use salvo::prelude::*;
+
+#[handler]
+async fn compress(res: &mut Response) {
+    // compression logic ...
+}
+
+#[tokio::main]
+async fn main() {
+    let router = Router::new()
+        .hoop_when(compress, |req: &Request, _depot: &Depot| {
+            // Only compress if the client accepts gzip
+            req.headers()
+                .get("accept-encoding")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.contains("gzip"))
+                .unwrap_or(false)
+        })
+        .get(handler);
+
+    let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
+    Server::new(acceptor).serve(router).await;
+}
+```
+
+The underlying type is `WhenHoop<H, F>`, which itself implements `Handler`. When the filter returns `false`, `WhenHoop` simply calls `ctrl.call_next()` and skips the inner middleware's logic.
+
+## Handler-level hoops
+
+The `.hoop()` and `.hoop_when()` methods are also available directly on `Handler` values via `HoopedHandler`. This lets you attach middleware to a single handler rather than an entire router branch:
+
+```rust
+use salvo::prelude::*;
+
+let guarded = my_handler.hoop(auth_check);
+
+let router = Router::new()
+    .push(Router::with_path("protected").get(guarded));
+```
+
+## Sharing data between middleware and handlers
+
+Use `Depot` to pass data produced by middleware down to handlers. For details on the `Depot` API, see [Depot: sharing data across handlers](/core/depot).

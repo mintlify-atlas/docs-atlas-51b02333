@@ -1,0 +1,185 @@
+---
+title: "Core concepts: how Salvo processes requests"
+description: "Understand the six key abstractions in Salvo — Handler, Router, Middleware, Depot, FlowCtrl, and Service — and how they compose to handle HTTP requests."
+---
+
+Salvo processes every HTTP request through a pipeline of handlers arranged in a routing tree. Understanding the six core abstractions — Handler, Router, Middleware (hoop), Depot, FlowCtrl, and Service — gives you a mental model for how any Salvo application is structured.
+
+<AccordionGroup>
+  <Accordion title="Handler" defaultOpen={true}>
+    A handler is an async function decorated with `#[handler]`. It can accept typed parameters extracted from the request (such as `&mut Request`, `&mut Response`, or `&mut Depot`) and return a value that implements `Writer` or `Scribe`.
+
+    ```rust
+    use salvo::prelude::*;
+
+    #[handler]
+    async fn hello() -> &'static str {
+        "Hello World"
+    }
+    ```
+
+    Salvo uses zero-cost extraction: if a parameter type is omitted from the function signature, it is simply not extracted. This means a handler that only writes a static string does not pay for parsing the request body or headers.
+
+    Handlers can also return `Result<T, E>` where both `T` and `E` implement `Writer`:
+
+    ```rust
+    #[handler]
+    async fn hello_zh() -> Result<&'static str, ()> {
+        Ok("你好，世界！")
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="Router">
+    `Router` organises handlers into a tree. Each node matches a path segment or an HTTP method. You build the tree by chaining `.push()`, `.path()`, `.get()`, `.post()`, `.delete()`, and related methods.
+
+    ```rust
+    use salvo::prelude::*;
+
+    let router = Router::new()
+        .get(index)
+        .push(
+            Router::with_path("users")
+                .hoop(auth)
+                .post(create_user)
+                .push(
+                    Router::with_path("{id:num}")
+                        .post(update_user)
+                        .delete(delete_user),
+                ),
+        )
+        .push(
+            Router::with_path("users")
+                .get(list_users)
+                .push(Router::with_path("{id:num}").get(show_user)),
+        );
+    ```
+
+    Path parameters use curly-brace syntax. `{id:num}` captures a numeric segment and names it `id`. Multiple routers can match the same path prefix, which lets you apply different middleware to different verbs on the same resource.
+
+    The `.then()` combinator conditionally extends the router at build time, useful for feature flags:
+
+    ```rust
+    let router = Router::new()
+        .then(|r| {
+            if debug_mode { r.push(Router::with_path("debug").get(debug)) }
+            else { r }
+        });
+    ```
+  </Accordion>
+
+  <Accordion title="Middleware (hoop)">
+    In Salvo, middleware is just a handler attached with `.hoop()`. There is no separate trait or generic parameter. Middleware runs before the downstream handlers in the same router subtree.
+
+    ```rust
+    use salvo::http::header::{self, HeaderValue};
+    use salvo::prelude::*;
+
+    #[handler]
+    async fn add_header(res: &mut Response) {
+        res.headers_mut()
+            .insert(header::SERVER, HeaderValue::from_static("Salvo"));
+    }
+
+    #[handler]
+    async fn hello() -> &'static str {
+        "Hello World"
+    }
+
+    // add_header runs before hello for every request on this router
+    let router = Router::new().hoop(add_header).get(hello);
+    ```
+
+    Because middleware is a handler, it can accept the same typed parameters as any other handler, including `&mut Depot` and `&mut FlowCtrl`.
+  </Accordion>
+
+  <Accordion title="Depot">
+    `Depot` is a per-request key-value store. Middleware inserts data by key; downstream handlers retrieve it. This is how you pass authentication results, database connections, or any request-scoped state through the pipeline without global variables.
+
+    ```rust
+    use salvo::prelude::*;
+
+    #[handler]
+    async fn set_user(depot: &mut Depot) {
+        depot.insert("user", "client");
+    }
+
+    #[handler]
+    async fn hello(depot: &mut Depot) -> String {
+        format!(
+            "Hello {}",
+            depot.get::<&str>("user").copied().unwrap_or_default()
+        )
+    }
+
+    let router = Router::new().hoop(set_user).goal(hello);
+    ```
+
+    `depot.insert(key, value)` stores any `Send + Sync + 'static` value. `depot.get::<T>(key)` retrieves it by type and key. `depot.obtain::<T>()` retrieves by type alone, useful for typed state injected by middleware.
+  </Accordion>
+
+  <Accordion title="FlowCtrl">
+    `FlowCtrl` lets a handler short-circuit the remaining pipeline. Call `ctrl.skip_rest()` to stop processing and return the current response immediately — for example, when an authentication check fails.
+
+    ```rust
+    use salvo::prelude::*;
+
+    #[handler]
+    async fn auth_check(
+        res: &mut Response,
+        depot: &mut Depot,
+        ctrl: &mut FlowCtrl,
+    ) {
+        let token = // ... extract token from request
+    #   "valid";
+        if token != "valid" {
+            res.status_code(StatusCode::UNAUTHORIZED);
+            ctrl.skip_rest(); // stop here; don't call downstream handlers
+            return;
+        }
+        depot.insert("authenticated", true);
+    }
+    ```
+
+    Without `ctrl.skip_rest()`, Salvo continues executing the remaining handlers in the chain after the current one returns.
+  </Accordion>
+
+  <Accordion title="Service">
+    `Service` wraps a `Router` into a type that `Server` can serve. In most applications you pass the router directly to `Server::new(acceptor).serve(router)` and Salvo creates the `Service` implicitly. You can also create it explicitly if you need to configure error catchers or other service-level behaviour.
+
+    ```rust
+    use salvo::prelude::*;
+
+    #[handler]
+    async fn hello() -> &'static str {
+        "Hello World"
+    }
+
+    #[tokio::main]
+    async fn main() {
+        let router = Router::new().get(hello);
+        let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
+        Server::new(acceptor).serve(router).await;
+    }
+    ```
+
+    `TcpListener::new(addr).bind().await` returns an acceptor. Passing it to `Server::new` starts accepting connections; `serve(router)` begins dispatching requests through the routing tree.
+  </Accordion>
+</AccordionGroup>
+
+## Explore each concept in depth
+
+<CardGroup cols={2}>
+  <Card title="Handlers" icon="bolt" href="/core/handlers">
+    Parameter extraction, response writing, and error handling.
+  </Card>
+  <Card title="Routing" icon="route" href="/core/routing">
+    Path syntax, method filters, and nested router trees.
+  </Card>
+  <Card title="Middleware" icon="layer-group" href="/core/middleware">
+    Writing and composing middleware with `.hoop()`.
+  </Card>
+  <Card title="Depot" icon="box-archive" href="/core/depot">
+    Passing data between handlers using the per-request store.
+  </Card>
+</CardGroup>

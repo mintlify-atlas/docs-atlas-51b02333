@@ -1,0 +1,180 @@
+---
+title: "Deploying Salvo applications"
+description: "Build and deploy Salvo web applications for production: binary compilation, graceful shutdown, Unix sockets, and HTTP/3 with QUIC."
+---
+
+Salvo compiles to a single self-contained binary with no runtime dependencies beyond the OS. This page covers the steps and patterns that matter when moving from development to production: optimized builds, graceful shutdown, multi-listener setups, Unix sockets, and HTTP/3.
+
+## Compiling for production
+
+Use the `--release` profile. It enables full LLVM optimization and link-time optimization (LTO), which typically reduces binary size by 30–50% and improves throughput.
+
+```bash
+cargo build --release
+```
+
+The binary is placed at `target/release/<crate-name>`. Copy it to your server along with any static assets and certificate files your application reads at runtime.
+
+<Tip>
+For the smallest possible binary, add the following to your `Cargo.toml`. `opt-level = "z"` optimizes for size, `lto = true` enables link-time optimization, and `strip = true` removes debug symbols from the final binary.
+
+```toml
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+```
+</Tip>
+
+## Graceful shutdown
+
+A production server must finish in-flight requests before exiting. Salvo exposes a `ServerHandle` that you obtain from `server.handle()`. Calling `handle.stop_graceful(timeout)` signals the server to stop accepting new connections and waits for active requests to complete before the process exits.
+
+```rust
+use salvo::prelude::*;
+use salvo::server::ServerHandle;
+use tokio::signal;
+
+#[tokio::main]
+async fn main() {
+    let acceptor = TcpListener::new("127.0.0.1:8698").bind().await;
+    let server = Server::new(acceptor);
+    let handle = server.handle();
+
+    // Spawn the signal listener in the background
+    tokio::spawn(listen_shutdown_signal(handle));
+
+    server.serve(Router::new()).await;
+}
+
+async fn listen_shutdown_signal(handle: ServerHandle) {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(windows)]
+    let terminate = async {
+        signal::windows::ctrl_c()
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    tokio::select! {
+        _ = ctrl_c => println!("ctrl_c signal received"),
+        _ = terminate => println!("terminate signal received"),
+    };
+
+    // Pass None for no timeout, or Some(Duration) to force-exit after a deadline
+    handle.stop_graceful(None);
+}
+```
+
+Passing `None` to `stop_graceful` means the server waits indefinitely for in-flight requests. Pass `Some(Duration::from_secs(30))` to impose a hard deadline.
+
+## Multi-listener setup with `JoinedListener`
+
+A single `Server` can accept connections on multiple addresses and protocols simultaneously by joining listeners. This is useful for serving both HTTP and HTTPS, or for binding to multiple interfaces.
+
+```rust
+use salvo::prelude::*;
+
+#[tokio::main]
+async fn main() {
+    let http = TcpListener::new("0.0.0.0:80");
+    let https = TcpListener::new("0.0.0.0:443")
+        .rustls(tls_config());
+
+    // join() produces a JoinedListener that accepts on both addresses
+    let acceptor = http.join(https).bind().await;
+    Server::new(acceptor).serve(router()).await;
+}
+```
+
+You can chain more than two listeners: `a.join(b).join(c)`.
+
+## Unix socket support
+
+Unix domain sockets reduce syscall overhead compared to TCP loopback for same-host communication between a reverse proxy (e.g. nginx) and your Salvo process.
+
+Enable the feature flag:
+
+```toml
+[dependencies]
+salvo = { version = "*", features = ["unix"] }
+```
+
+Then bind to a socket path instead of a TCP address:
+
+```rust
+use salvo::prelude::*;
+use salvo::conn::unix::UnixListener;
+
+#[tokio::main]
+async fn main() {
+    let acceptor = UnixListener::new("/run/myapp/salvo.sock")
+        .bind()
+        .await;
+    Server::new(acceptor).serve(router()).await;
+}
+```
+
+Set the socket file permissions after binding so your reverse proxy user can connect:
+
+```bash
+chmod 660 /run/myapp/salvo.sock
+chown www-data:www-data /run/myapp/salvo.sock
+```
+
+## HTTP/3 with QUIC (quinn)
+
+Enable the `quinn` feature to serve HTTP/3 over QUIC. HTTP/3 requires TLS, so you need a TLS listener joined with the QUIC listener. Both can share the same port (UDP for QUIC, TCP for HTTP/1.1 and HTTP/2).
+
+```toml
+[dependencies]
+salvo = { version = "*", features = ["rustls", "quinn"] }
+```
+
+```rust
+use salvo::conn::quinn::QuinnListener;
+use salvo::conn::rustls::{Keycert, RustlsConfig};
+use salvo::prelude::*;
+
+#[tokio::main]
+async fn main() {
+    let cert = include_bytes!("../certs/cert.pem").to_vec();
+    let key = include_bytes!("../certs/key.pem").to_vec();
+
+    let config = RustlsConfig::new(
+        Keycert::new().cert(cert.as_slice()).key(key.as_slice()),
+    );
+
+    // TCP/TLS listener for HTTP/1.1 and HTTP/2
+    let tcp_tls = TcpListener::new(("0.0.0.0", 443_u16)).rustls(config.clone());
+
+    // QUIC listener for HTTP/3 — shares the same port (UDP)
+    let quic = QuinnListener::new(config.build_quinn_config().unwrap(), ("0.0.0.0", 443_u16));
+
+    let acceptor = quic.join(tcp_tls).bind().await;
+    Server::new(acceptor).serve(router()).await;
+}
+```
+
+<Note>
+HTTP/3 clients discover QUIC support through the `Alt-Svc` response header. Salvo sets this header automatically when the quinn listener is active, but you must ensure UDP port 443 is open in your firewall — many cloud providers block UDP by default.
+</Note>
+
+<Tip>
+For systemd-managed deployments, consider the `listenfd` feature flag. It lets Salvo inherit pre-bound sockets from systemd's socket activation (`ListenStream=`) so zero-downtime restarts and socket sharing between service instances work without custom orchestration code.
+</Tip>

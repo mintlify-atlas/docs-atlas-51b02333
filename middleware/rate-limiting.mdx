@@ -1,0 +1,248 @@
+---
+title: "Rate limiting requests in Salvo"
+description: "Protect Salvo endpoints with fixed-window and sliding-window rate limiters. Supports per-IP, per-user, and custom key extraction via RateIssuer and QuotaGetter."
+---
+
+Rate limiting controls how many requests a client can make within a time window, protecting your service from denial-of-service attempts and ensuring fair resource use. Salvo's `rate-limiter` crate is built around four composable traits: an issuer that identifies clients, a quota getter that defines limits, a guard that implements the algorithm, and a store that persists state.
+
+### Feature flag
+
+```toml
+[dependencies]
+salvo = { version = "*", features = [
+    "rate-limiter",
+    "fixed-guard",    # FixedGuard (fixed-window algorithm)
+    "sliding-guard",  # SlidingGuard (sliding-window algorithm)
+    "moka-store",     # in-memory MokaStore
+] }
+```
+
+### Core components
+
+| Component | Purpose |
+|-----------|---------|
+| `RateIssuer` | Extracts a key from each request (IP, user ID, API key, …) |
+| `QuotaGetter` | Returns a `BasicQuota` or `CelledQuota` for a given key |
+| `RateGuard` | Decides whether a request exceeds the quota |
+| `RateStore` | Persists guard state between requests |
+
+---
+
+## Fixed-window rate limiting
+
+`FixedGuard` counts requests in discrete windows of fixed duration. Use `BasicQuota` to set the limit.
+
+```rust
+use salvo::prelude::*;
+use salvo::rate_limiter::{BasicQuota, FixedGuard, MokaStore, RateLimiter, RemoteIpIssuer};
+
+let limiter = RateLimiter::new(
+    FixedGuard::new(),
+    MokaStore::new(),
+    RemoteIpIssuer,          // identify clients by direct-connection IP
+    BasicQuota::per_second(1), // 1 request per second per IP
+);
+
+let router = Router::with_hoop(limiter).get(hello);
+```
+
+### Static example
+
+```rust
+use salvo::prelude::*;
+use salvo::rate_limiter::{BasicQuota, FixedGuard, MokaStore, RateLimiter, RemoteIpIssuer};
+
+#[handler]
+async fn hello() -> &'static str {
+    "Hello World"
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt().init();
+
+    let limiter = RateLimiter::new(
+        FixedGuard::new(),
+        MokaStore::new(),
+        RemoteIpIssuer,
+        BasicQuota::per_second(1),
+    );
+    let router = Router::with_hoop(limiter).get(hello);
+    let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
+    Server::new(acceptor).serve(router).await;
+}
+```
+
+---
+
+## Sliding-window rate limiting
+
+`SlidingGuard` uses a sliding window algorithm with `CelledQuota`, which splits the window into cells for a smoother distribution. This avoids the burst allowed at window boundaries that fixed-window algorithms permit.
+
+```rust
+use salvo::rate_limiter::{CelledQuota, MokaStore, RateLimiter, SlidingGuard};
+
+// 1 request per second, 1 cell
+let quota = CelledQuota::per_second(1, 1);
+
+// 1 request per 5-second window, 1 cell
+let quota = CelledQuota::set_seconds(1, 1, 5);
+```
+
+---
+
+## Custom `RateIssuer` for per-user limits
+
+Implement `RateIssuer` to key rate limits on something other than IP address — for example a user ID extracted from a query parameter, a session, or a JWT claim:
+
+```rust
+use salvo::prelude::*;
+use salvo::rate_limiter::RateIssuer;
+
+struct UserIssuer;
+
+impl RateIssuer for UserIssuer {
+    type Key = String;
+
+    async fn issue(&self, req: &mut Request, _depot: &Depot) -> Option<Self::Key> {
+        req.query::<String>("user")
+    }
+}
+```
+
+---
+
+## Dynamic per-user quotas
+
+Implement `QuotaGetter` to return different limits for different keys:
+
+```rust
+use std::borrow::Borrow;
+use std::collections::HashMap;
+use std::hash::Hash;
+use std::sync::LazyLock;
+
+use salvo::Error;
+use salvo::rate_limiter::{CelledQuota, MokaStore, QuotaGetter, RateLimiter, SlidingGuard};
+
+static USER_QUOTAS: LazyLock<HashMap<String, CelledQuota>> = LazyLock::new(|| {
+    let mut map = HashMap::new();
+    map.insert("user1".into(), CelledQuota::per_second(1, 1));
+    map.insert("user2".into(), CelledQuota::set_seconds(1, 1, 5));
+    map.insert("user3".into(), CelledQuota::set_seconds(1, 1, 10));
+    map
+});
+
+struct CustomQuotaGetter;
+
+impl QuotaGetter<String> for CustomQuotaGetter {
+    type Quota = CelledQuota;
+    type Error = Error;
+
+    async fn get<Q>(&self, key: &Q) -> Result<Self::Quota, Self::Error>
+    where
+        String: Borrow<Q>,
+        Q: Hash + Eq + Sync,
+    {
+        USER_QUOTAS
+            .get(key)
+            .cloned()
+            .ok_or_else(|| Error::other("user not found"))
+    }
+}
+```
+
+### Dynamic example (full)
+
+```rust
+use std::borrow::Borrow;
+use std::collections::HashMap;
+use std::hash::Hash;
+use std::sync::LazyLock;
+
+use salvo::Error;
+use salvo::prelude::*;
+use salvo::rate_limiter::{
+    CelledQuota, MokaStore, QuotaGetter, RateIssuer, RateLimiter, SlidingGuard,
+};
+
+static USER_QUOTAS: LazyLock<HashMap<String, CelledQuota>> = LazyLock::new(|| {
+    let mut map = HashMap::new();
+    map.insert("user1".into(), CelledQuota::per_second(1, 1));
+    map.insert("user2".into(), CelledQuota::set_seconds(1, 1, 5));
+    map.insert("user3".into(), CelledQuota::set_seconds(1, 1, 10));
+    map
+});
+
+struct UserIssuer;
+impl RateIssuer for UserIssuer {
+    type Key = String;
+    async fn issue(&self, req: &mut Request, _depot: &Depot) -> Option<Self::Key> {
+        req.query::<Self::Key>("user")
+    }
+}
+
+struct CustomQuotaGetter;
+impl QuotaGetter<String> for CustomQuotaGetter {
+    type Quota = CelledQuota;
+    type Error = Error;
+
+    async fn get<Q>(&self, key: &Q) -> Result<Self::Quota, Self::Error>
+    where
+        String: Borrow<Q>,
+        Q: Hash + Eq + Sync,
+    {
+        USER_QUOTAS
+            .get(key)
+            .cloned()
+            .ok_or_else(|| Error::other("user not found"))
+    }
+}
+
+#[handler]
+async fn limited() -> &'static str {
+    "Limited page"
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt().init();
+
+    let limiter = RateLimiter::new(
+        SlidingGuard::new(),
+        MokaStore::new(),
+        UserIssuer,
+        CustomQuotaGetter,
+    );
+    let router = Router::new()
+        .push(Router::with_path("limited").hoop(limiter).get(limited));
+
+    let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
+    Server::new(acceptor).serve(router).await;
+}
+```
+
+---
+
+## Response headers
+
+Enable rate-limit informational headers by calling `.add_headers(true)` on the limiter:
+
+```rust
+let limiter = RateLimiter::new(guard, store, issuer, quota)
+    .add_headers(true);
+```
+
+This adds three headers to every response:
+
+| Header | Value |
+|--------|-------|
+| `X-RateLimit-Limit` | Maximum requests allowed in the window |
+| `X-RateLimit-Remaining` | Requests remaining before the limit is hit |
+| `X-RateLimit-Reset` | Unix timestamp when the window resets |
+
+When the limit is exceeded the middleware returns `429 Too Many Requests` and skips downstream handlers.
+
+<Warning>
+`MokaStore` is in-process memory. State is not shared across multiple server processes or pods. For production deployments with horizontal scaling, use a distributed store (Redis or similar) so rate-limit counters are consistent across all instances.
+</Warning>

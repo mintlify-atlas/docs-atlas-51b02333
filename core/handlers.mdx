@@ -1,0 +1,229 @@
+---
+title: "Handlers: writing request logic in Salvo"
+description: "Learn how the #[handler] macro works in Salvo: parameter injection, return types like Json and Text, error handling with Result, and struct-based handlers."
+---
+
+Handlers are the functions that produce responses in a Salvo application. Every piece of request logic — whether it is the final response writer or a middleware step — implements the same `Handler` trait, and the `#[handler]` macro makes writing one as simple as declaring an `async fn`.
+
+## The `#[handler]` macro
+
+Applying `#[handler]` to an `async fn` converts it into a zero-size struct that implements the `Handler` trait. You get automatic `#[async_trait]` support, flexible argument injection, and direct return-value rendering — all without writing any boilerplate.
+
+```rust
+use salvo::prelude::*;
+
+#[handler]
+async fn hello() -> &'static str {
+    "hello world!"
+}
+```
+
+This is exactly equivalent to writing:
+
+```rust
+use salvo::prelude::*;
+
+#[allow(non_camel_case_types)]
+struct hello;
+
+#[async_trait]
+impl Handler for hello {
+    async fn handle(
+        &self,
+        _req: &mut Request,
+        _depot: &mut Depot,
+        res: &mut Response,
+        _ctrl: &mut FlowCtrl,
+    ) {
+        res.render(Text::Plain("hello world!"));
+    }
+}
+```
+
+<Note>
+You do not need to add `#[async_trait]` yourself. The `#[handler]` macro inserts it for you. When implementing `Handler` directly (without the macro), you must add `#[async_trait]` manually.
+</Note>
+
+## Flexible parameter injection
+
+The `Handler` trait's `handle` method always receives `req`, `depot`, `res`, and `ctrl`. The `#[handler]` macro lets you declare only the parameters you actually use, in any order:
+
+```rust
+use salvo::prelude::*;
+
+// Only the response is needed
+#[handler]
+async fn greet(res: &mut Response) {
+    res.render(Text::Plain("Hello!"));
+}
+
+// Access request, depot, and flow control
+#[handler]
+async fn check_auth(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+    ctrl: &mut FlowCtrl,
+) {
+    let token: Option<String> = req.header("authorization");
+    if token.is_none() {
+        res.status_code(StatusCode::UNAUTHORIZED);
+        ctrl.skip_rest();
+    } else {
+        ctrl.call_next(req, depot, res).await;
+    }
+}
+```
+
+The four injectable parameters are:
+
+| Parameter | Type | Description |
+|---|---|---|
+| `req` | `&mut Request` | The incoming HTTP request |
+| `depot` | `&mut Depot` | Per-request shared data store |
+| `res` | `&mut Response` | The outgoing HTTP response |
+| `ctrl` | `&mut FlowCtrl` | Controls execution of remaining handlers |
+
+## Struct-based handlers
+
+When a handler needs to carry configuration or state, use `#[handler]` on an `impl` block. The macro looks for a method named `handle` inside the block and wires it up:
+
+```rust
+use salvo::prelude::*;
+
+struct Hello {
+    greeting: &'static str,
+}
+
+#[handler]
+impl Hello {
+    async fn handle(&self, res: &mut Response) {
+        res.render(Text::Plain(self.greeting));
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let handler = Hello { greeting: "Bonjour!" };
+    let router = Router::new().get(handler);
+    let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
+    Server::new(acceptor).serve(router).await;
+}
+```
+
+## Return types
+
+Any type that implements the `Scribe` trait can be returned directly from a handler decorated with `#[handler]`. The framework calls `Scribe::render` on the return value to write it into the response.
+
+Common return types:
+
+```rust
+use salvo::prelude::*;
+use serde::Serialize;
+
+// Plain string — sets content-type: text/plain
+#[handler]
+async fn plain() -> &'static str {
+    "hello"
+}
+
+// Owned string — also text/plain
+#[handler]
+async fn owned() -> String {
+    format!("hello {}", "world")
+}
+
+// Typed Text variants
+#[handler]
+async fn html_page() -> Text<&'static str> {
+    Text::Html("<h1>Hello</h1>")
+}
+
+// JSON — serializes with serde_json, sets content-type: application/json
+#[derive(Serialize)]
+struct User { name: String }
+
+#[handler]
+async fn get_user() -> Json<User> {
+    Json(User { name: "Alice".into() })
+}
+```
+
+## Error handling
+
+Handlers can return `Result<T, E>` as long as both `T` and `E` implement `Writer`. On `Err`, Salvo calls `Writer::write` on the error value, which lets you set the status code and body however you need.
+
+```rust
+use salvo::prelude::*;
+
+// With the anyhow feature enabled, anyhow::Error maps to 500
+#[handler]
+async fn may_fail() -> Result<&'static str, anyhow::Error> {
+    // Err(anyhow::anyhow!("something went wrong"))
+    Ok("success")
+}
+
+// Custom error type with a tailored response
+struct NotFound;
+
+#[async_trait]
+impl Writer for NotFound {
+    async fn write(self, _req: &mut Request, _depot: &mut Depot, res: &mut Response) {
+        res.status_code(StatusCode::NOT_FOUND);
+        res.render(Text::Plain("resource not found"));
+    }
+}
+
+#[handler]
+async fn find_resource() -> Result<&'static str, NotFound> {
+    Err(NotFound)
+}
+```
+
+You can also use `StatusError` for standard HTTP errors without defining a custom type:
+
+```rust
+use salvo::prelude::*;
+
+#[handler]
+async fn protected(req: &mut Request) -> Result<&'static str, StatusError> {
+    let token: Option<String> = req.header("authorization");
+    if token.is_none() {
+        return Err(StatusError::unauthorized());
+    }
+    Ok("secret data")
+}
+```
+
+## Implementing `Handler` directly
+
+For advanced cases where the macro is not sufficient, implement `Handler` directly. You must add `#[async_trait]` yourself:
+
+```rust
+use salvo::prelude::*;
+use salvo::http::Body;
+
+pub struct MaxSizeHandler(u64);
+
+#[async_trait]
+impl Handler for MaxSizeHandler {
+    async fn handle(
+        &self,
+        req: &mut Request,
+        _depot: &mut Depot,
+        res: &mut Response,
+        ctrl: &mut FlowCtrl,
+    ) {
+        if let Some(upper) = req.body().size_hint().upper() {
+            if upper > self.0 {
+                res.render(StatusError::payload_too_large());
+                ctrl.skip_rest();
+            } else {
+                ctrl.call_next(req, depot, res).await;
+            }
+        }
+    }
+}
+```
+
+For information on how handlers are layered around routes, see [Middleware in Salvo](/core/middleware).

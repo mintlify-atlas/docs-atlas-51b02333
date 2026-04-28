@@ -1,0 +1,197 @@
+---
+title: "Depot: sharing data across handlers"
+description: "Learn how Salvo's Depot works as a per-request store. Use insert/get for keyed access or inject/obtain for type-based access to share data across handlers."
+---
+
+`Depot` is a per-request data store that travels alongside `Request`, `Response`, and `FlowCtrl` through every handler in the chain. Middleware uses it to produce data — authenticated user, parsed session, database connection — and downstream handlers consume it without repeating the work.
+
+## What Depot is
+
+Internally, `Depot` is a `HashMap<String, Box<dyn Any + Send + Sync>>`. Every value is type-erased. You put anything into it that is `Send + Sync + 'static` and get it back by specifying the concrete type at the retrieval site. A new `Depot` is created for each incoming request and dropped when the entire handler chain has finished.
+
+<Note>
+`Depot` is dropped after the request completes. Do not store values in it that you expect to survive across requests — use application state for that.
+</Note>
+
+## String-keyed access
+
+`depot.insert(key, value)` and `depot.get::<T>(key)` work with any `Into<String>` key:
+
+```rust
+use salvo::prelude::*;
+
+#[handler]
+async fn set_user(depot: &mut Depot) {
+    depot.insert("user", "client");
+}
+
+#[handler]
+async fn hello(depot: &mut Depot) -> String {
+    format!(
+        "Hello {}",
+        depot.get::<&str>("user").copied().unwrap_or_default()
+    )
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt().init();
+
+    let router = Router::new().hoop(set_user).goal(hello);
+
+    let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
+    Server::new(acceptor).serve(router).await;
+}
+```
+
+`depot.get::<T>(key)` returns `Result<&T, Option<&Box<dyn Any + Send + Sync>>>`:
+
+- `Ok(&T)` — value found and downcast succeeded
+- `Err(None)` — key not present
+- `Err(Some(...))` — key present but the stored type did not match `T`
+
+Use `.ok()` or `.unwrap_or_default()` when you simply want an `Option<&T>`.
+
+Mutably borrowing a stored value works the same way:
+
+```rust
+let count: &mut u32 = depot.get_mut::<u32>("counter").unwrap();
+*count += 1;
+```
+
+## Type-based access
+
+When only one value of a given type needs to be stored, use `inject` and `obtain` instead of providing a key. The key is derived automatically from the type's `TypeId`:
+
+```rust
+use salvo::prelude::*;
+
+struct CurrentUser {
+    id: u64,
+    name: String,
+}
+
+#[handler]
+async fn authenticate(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+    ctrl: &mut FlowCtrl,
+) {
+    // In a real app, verify a token and load the user
+    let user = CurrentUser {
+        id: 42,
+        name: "Alice".into(),
+    };
+    depot.inject(user);
+    ctrl.call_next(req, depot, res).await;
+}
+
+#[handler]
+async fn profile(depot: &mut Depot, res: &mut Response) {
+    // Retrieves the value injected above
+    if let Ok(user) = depot.obtain::<CurrentUser>() {
+        res.render(Text::Plain(format!("Hello, {}!", user.name)));
+    } else {
+        res.render(StatusError::unauthorized());
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let router = Router::new()
+        .hoop(authenticate)
+        .push(Router::with_path("profile").get(profile));
+
+    let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
+    Server::new(acceptor).serve(router).await;
+}
+```
+
+`depot.obtain_mut::<T>()` provides a mutable reference to the injected value:
+
+```rust
+let user = depot.obtain_mut::<CurrentUser>().unwrap();
+user.name = "Updated".into();
+```
+
+## Checking and removing values
+
+```rust
+// Check by string key
+if depot.contains_key("user") { /* ... */ }
+
+// Check for an injected type (uses TypeId, not a string key)
+if depot.contains::<CurrentUser>() { /* ... */ }
+
+// Remove by string key and return the value
+let user: &str = depot.remove::<&str>("user").unwrap();
+
+// Remove an injected type by TypeId
+let user: CurrentUser = depot.scrape::<CurrentUser>().unwrap();
+
+// Delete by key without retrieving the value
+depot.delete("user");
+```
+
+## Using `Extractible` with `Depot`
+
+When a struct derives `Extractible`, fields annotated with `source(from = "depot")` are filled automatically from values previously inserted with `depot.insert()`. The field name must match the key used during insertion:
+
+```rust
+use salvo::macros::Extractible;
+use salvo::prelude::*;
+use serde::{Deserialize, Serialize};
+
+// Middleware populates Depot
+#[handler]
+async fn inject_user(depot: &mut Depot) {
+    depot.insert("user_id", 42i64);
+    depot.insert("user_role", "admin".to_owned());
+    depot.insert("is_verified", true);
+}
+
+// Handler extracts the struct from Depot automatically
+#[derive(Serialize, Deserialize, Extractible, Debug)]
+#[salvo(extract(default_source(from = "depot")))]
+struct UserContext {
+    user_id: i64,
+    user_role: String,
+    is_verified: bool,
+}
+
+#[handler]
+async fn dashboard(req: &mut Request, depot: &mut Depot) -> String {
+    let ctx: UserContext = req.extract(depot).await.unwrap();
+    format!("role={}, verified={}", ctx.user_role, ctx.is_verified)
+}
+
+#[tokio::main]
+async fn main() {
+    let router = Router::new()
+        .hoop(inject_user)
+        .push(Router::with_path("dashboard").get(dashboard));
+
+    let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
+    Server::new(acceptor).serve(router).await;
+}
+```
+
+## Common pattern: middleware stores, handler reads
+
+The typical Salvo pattern for sharing authentication data, database handles, or any other per-request context follows three steps:
+
+<Steps>
+  <Step title="Add middleware to the router">
+    Attach middleware with `.hoop()` to the router branch that requires it.
+  </Step>
+  <Step title="Middleware inserts into Depot">
+    Inside the middleware, compute the value and call `depot.inject(value)` or `depot.insert(key, value)`.
+    Then call `ctrl.call_next(req, depot, res).await` to continue.
+  </Step>
+  <Step title="Handler reads from Depot">
+    In any downstream handler, call `depot.obtain::<T>()` or `depot.get::<T>(key)` to retrieve the value.
+  </Step>
+</Steps>
+
+Values inserted by a parent middleware are visible to all sibling and child handlers in the same request. Values inserted by one handler are visible to every handler that runs after it in the same chain.

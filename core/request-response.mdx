@@ -1,0 +1,306 @@
+---
+title: "Request and Response in Salvo"
+description: "Learn how to read request data, extract query params and JSON bodies, and write responses in Salvo using Request, Response, and extractors."
+---
+
+Every Salvo handler receives a `&mut Request` representing the incoming HTTP message and a `&mut Response` used to build the reply. Both types provide rich APIs for accessing headers, path parameters, query strings, and bodies, and for writing structured responses.
+
+## Reading from `Request`
+
+### Path parameters
+
+Parameters defined with `{name}` in a route path are accessible via `req.param::<T>()`:
+
+```rust
+use salvo::prelude::*;
+
+#[handler]
+async fn show_user(req: &mut Request, res: &mut Response) {
+    // Path: /users/{id}
+    let id: u64 = req.param("id").unwrap_or(0);
+    res.render(Text::Plain(format!("user {id}")));
+}
+```
+
+Use `req.params()` to get a reference to the full `PathParams` map when you need to read multiple parameters at once.
+
+### Query parameters
+
+`req.query::<T>(key)` parses a single query parameter by name. The value is deserialized from its string representation, so numeric types and booleans work automatically:
+
+```rust
+use salvo::prelude::*;
+
+#[handler]
+async fn search(req: &mut Request, res: &mut Response) {
+    // URL: /search?page=2&limit=10
+    let page: u32 = req.query("page").unwrap_or(1);
+    let limit: u32 = req.query("limit").unwrap_or(20);
+    res.render(Text::Plain(format!("page={page} limit={limit}")));
+}
+```
+
+Use `req.queries()` for direct access to the full `MultiMap<String, String>` when you need all parameters.
+
+### Form data
+
+`req.form(key).await` reads a single field from an `application/x-www-form-urlencoded` or `multipart/form-data` body:
+
+```rust
+use salvo::prelude::*;
+
+#[handler]
+async fn submit(req: &mut Request, res: &mut Response) {
+    let username: String = req.form("username").await.unwrap_or_default();
+    let email: String = req.form("email").await.unwrap_or_default();
+    res.render(Text::Plain(format!("received: {username} / {email}")));
+}
+```
+
+### Request body (raw bytes / JSON)
+
+Call `req.payload().await` to read the entire body as `Bytes`. The default size limit is 64 KB; use `req.payload_with_max_size(n).await` to override it for a specific request.
+
+To parse the body as JSON, deserialize the bytes yourself or use the `Extractible` derive macro shown below:
+
+```rust
+use salvo::prelude::*;
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct CreateUser {
+    name: String,
+    email: String,
+}
+
+#[handler]
+async fn create(req: &mut Request, res: &mut Response) {
+    let bytes = req.payload().await.unwrap();
+    let body: CreateUser = serde_json::from_slice(bytes).unwrap();
+    res.render(Text::Plain(format!("creating user: {}", body.name)));
+}
+```
+
+### Request headers
+
+```rust
+use salvo::prelude::*;
+
+#[handler]
+async fn read_headers(req: &mut Request, res: &mut Response) {
+    // Typed deserialization from a single header
+    let content_type: Option<String> = req.header("content-type");
+
+    // Raw access to the full header map
+    let all_headers = req.headers();
+
+    res.render(Text::Plain(format!("content-type: {content_type:?}")));
+}
+```
+
+## The `Extractible` derive macro
+
+For structs that gather fields from multiple sources in a single operation, derive `Extractible` and annotate each field with `#[salvo(extract(source(from = "...")))]`. Valid sources are `"param"`, `"query"`, `"body"`, and `"depot"`.
+
+```rust
+use salvo::macros::Extractible;
+use salvo::prelude::*;
+use serde::{Deserialize, Serialize};
+
+// Fields default to the body; id comes from the URL path parameter
+#[derive(Serialize, Deserialize, Extractible, Debug)]
+#[salvo(extract(
+    default_source(from = "query"),
+    default_source(from = "param"),
+    default_source(from = "body")
+))]
+struct GoodMan<'a> {
+    #[serde(default)]
+    id: i64,
+    #[serde(default)]
+    username: &'a str,
+    first_name: String,
+    last_name: &'a str,
+    #[salvo(extract(alias = "lovers"))]
+    lover: &'a str,
+}
+
+#[handler]
+async fn edit(req: &mut Request, depot: &mut Depot) -> String {
+    let good_man: GoodMan<'_> = req.extract(depot).await.unwrap();
+    format!("{good_man:#?}")
+}
+
+#[handler]
+async fn show(req: &mut Request, res: &mut Response) {
+    let id = req.params().get("id").unwrap();
+    let content = format!(
+        r#"<form action="/{}?username=jobs" method="post">
+            <input type="text" name="first_name" />
+            <input type="text" name="last_name" />
+            <input type="submit" />
+        </form>"#,
+        id
+    );
+    res.render(Text::Html(content));
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt().init();
+
+    let router = Router::new()
+        .push(Router::with_path("{id}").get(show).post(edit));
+
+    let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
+    Server::new(acceptor).serve(router).await;
+}
+```
+
+You can also extract data that was injected into `Depot` by middleware. Use `default_source(from = "depot")` and insert matching keys in the middleware:
+
+```rust
+#[derive(Serialize, Deserialize, Extractible, Debug)]
+#[salvo(extract(default_source(from = "depot")))]
+struct UserContext {
+    user_id: i64,
+    user_role: String,
+    is_verified: bool,
+}
+
+// Middleware sets the depot keys
+#[handler]
+async fn inject_user(depot: &mut Depot) {
+    depot.insert("user_id", 42i64);
+    depot.insert("user_role", "admin".to_owned());
+    depot.insert("is_verified", true);
+}
+
+// Handler extracts them as a typed struct
+#[handler]
+async fn profile(req: &mut Request, depot: &mut Depot) -> String {
+    let ctx: UserContext = req.extract(depot).await.unwrap();
+    format!("{ctx:#?}")
+}
+```
+
+## Writing responses
+
+### `res.render()`
+
+`Response::render()` accepts any value that implements `Scribe`. The method sets the `Content-Type` header and writes the body in one call:
+
+```rust
+use salvo::prelude::*;
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct Article { title: String }
+
+#[handler]
+async fn handler(res: &mut Response) {
+    // Plain text
+    res.render(Text::Plain("hello"));
+
+    // HTML
+    res.render(Text::Html("<h1>Hello</h1>"));
+
+    // JSON (content-type: application/json)
+    res.render(Json(Article { title: "Salvo".into() }));
+}
+```
+
+For convenience, returning a `Scribe` value directly from a handler decorated with `#[handler]` is equivalent to calling `res.render()`:
+
+```rust
+#[handler]
+async fn get_article() -> Json<Article> {
+    Json(Article { title: "Salvo".into() })
+}
+```
+
+### Status codes
+
+Call `res.status_code(code)` to set an explicit status code. If you call `res.render()` without setting a code, Salvo defaults to `200 OK` when a body is present:
+
+```rust
+use salvo::prelude::*;
+use salvo::http::StatusCode;
+
+#[handler]
+async fn created(res: &mut Response) {
+    res.status_code(StatusCode::CREATED);
+    res.render(Text::Plain("resource created"));
+}
+```
+
+`StatusError` provides constructors for standard error responses:
+
+```rust
+use salvo::prelude::*;
+
+#[handler]
+async fn not_found(res: &mut Response) {
+    res.render(StatusError::not_found());
+}
+
+#[handler]
+async fn bad_request(res: &mut Response) {
+    res.render(
+        StatusError::bad_request()
+            .brief("Invalid input")
+            .detail("The 'email' field is required"),
+    );
+}
+```
+
+### Response headers
+
+Access the mutable header map directly:
+
+```rust
+use salvo::http::header::{self, HeaderValue};
+use salvo::prelude::*;
+
+#[handler]
+async fn with_custom_header(res: &mut Response) {
+    res.headers_mut()
+        .insert(header::SERVER, HeaderValue::from_static("Salvo"));
+    res.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    res.render(Text::Plain("ok"));
+}
+```
+
+Or use the `add_header` helper, which accepts any type convertible to `HeaderValue`:
+
+```rust
+res.add_header("x-request-id", "abc123", true).unwrap();
+```
+
+### Redirects
+
+`Redirect` implements `Scribe`, so pass it to `res.render()`:
+
+```rust
+use salvo::prelude::*;
+use salvo::writing::Redirect;
+
+#[handler]
+async fn old_url(res: &mut Response) {
+    // 302 Found
+    res.render(Redirect::found("/new-path"));
+}
+
+#[handler]
+async fn moved(res: &mut Response) {
+    // 308 Permanent Redirect
+    res.render(Redirect::permanent("https://new.example.com/"));
+}
+
+#[handler]
+async fn after_post(res: &mut Response) {
+    // 303 See Other — typical after a form submission
+    res.render(Redirect::other("/success"));
+}
+```

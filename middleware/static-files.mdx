@@ -1,0 +1,156 @@
+---
+title: "Serving static files with Salvo"
+description: "Serve static files and directory listings in Salvo using StaticDir and StaticFile, with support for embedded files via rust-embed."
+---
+
+Salvo bundles a `serve-static` feature that covers three common scenarios: serving an entire directory tree with optional listings, serving a single named file, and embedding assets directly into the binary at compile time for zero-dependency deployments.
+
+## Enable the feature
+
+```toml
+[dependencies]
+salvo = { version = "*", features = ["serve-static"] }
+```
+
+---
+
+## `StaticDir` — serve a directory
+
+`StaticDir` maps a URL path prefix to one or more filesystem directories and serves files found within them. Multiple root directories are searched in order, which is useful for theme layering or separating user-uploaded content from bundled assets.
+
+### Basic setup
+
+```rust
+use salvo::prelude::*;
+use salvo::serve_static::StaticDir;
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt().init();
+
+    let router = Router::with_path("{*path}").get(
+        StaticDir::new([
+            "static/boy",
+            "static/girl",
+        ])
+        .include_dot_files(false)
+        .defaults("index.html")
+        .auto_list(true),
+    );
+
+    let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
+    Server::new(acceptor).serve(router).await;
+}
+```
+
+### Multiple roots with fallback ordering
+
+Passing a slice of paths tells `StaticDir` to look in each directory in order and serve the first match. This example searches four directories, falling back from project-relative paths to workspace-relative paths:
+
+```rust
+let router = Router::with_path("{*path}").get(
+    StaticDir::new([
+        "static-dir-list/static/boy",
+        "static-dir-list/static/girl",
+        "static/boy",
+        "static/girl",
+    ])
+    .include_dot_files(false)
+    .defaults("index.html")
+    .auto_list(true),
+);
+```
+
+### Configuration options
+
+| Method | Default | Description |
+|---|---|---|
+| `.defaults(name)` | `"index.html"` | File to serve when a directory path is requested |
+| `.auto_list(bool)` | `false` | Render an HTML directory listing when no default file exists |
+| `.include_dot_files(bool)` | `false` | Expose hidden files (names starting with `.`) |
+
+<Warning>
+Enable `.auto_list(true)` only when directory listings are intentional. Exposing a listing of a directory that contains sensitive files can be a security risk.
+</Warning>
+
+---
+
+## `StaticFile` — serve a single file
+
+Use `StaticFile` when a route should always return exactly one file regardless of the URL path, for example serving a compiled SPA bundle:
+
+```rust
+use salvo::prelude::*;
+
+let router = Router::with_path("app")
+    .get(StaticFile::new("dist/index.html"));
+```
+
+`StaticFile` sets correct `Content-Type`, `Content-Length`, `ETag`, and `Last-Modified` headers and handles `If-None-Match` / `If-Modified-Since` conditional requests automatically.
+
+### Compression with `StaticFile`
+
+Combine `StaticFile` with the `Compression` middleware to serve compressed responses:
+
+```rust
+use salvo::prelude::*;
+
+let router = Router::new()
+    .push(
+        Router::with_hoop(Compression::new().enable_brotli(CompressionLevel::Fastest))
+            .path("sse_chat")
+            .get(StaticFile::new(base_dir.join("sse_chat.txt"))),
+    )
+    .push(
+        Router::with_hoop(Compression::new().enable_zstd(CompressionLevel::Fastest))
+            .path("todos")
+            .get(StaticFile::new(base_dir.join("todos.txt"))),
+    );
+```
+
+---
+
+## `StaticEmbed` — embed assets into the binary
+
+For deployments where shipping the binary alone (without a `static/` directory) is desirable — containers, CLIs, serverless — you can embed assets at compile time using the `rust-embed` crate and Salvo's `StaticEmbed` handler.
+
+### Add dependencies
+
+```toml
+[dependencies]
+salvo = { version = "*", features = ["serve-static"] }
+rust-embed = "8"
+```
+
+### Derive `RustEmbed`
+
+Annotate a unit struct with `#[derive(RustEmbed)]` and point `folder` at the directory you want to bundle:
+
+```rust
+use rust_embed::RustEmbed;
+
+#[derive(RustEmbed)]
+#[folder = "static/"]
+struct Assets;
+```
+
+At compile time, every file under `static/` is hashed and baked into the binary.
+
+### Serve embedded assets
+
+Pass the `Assets` type to `StaticEmbed::new()` and attach it to a catch-all route:
+
+```rust
+use salvo::prelude::*;
+use salvo::serve_static::StaticEmbed;
+
+let router = Router::with_path("{*path}").get(StaticEmbed::new::<Assets>());
+```
+
+<Note>
+`StaticEmbed` serves a built-in `index.html` when the path resolves to a directory, matching the behaviour of `StaticDir::defaults("index.html")`. ETag headers are derived from the asset hash computed at compile time, so they are stable across restarts.
+</Note>
+
+<Tip>
+Embedded assets are ideal for single-binary deployments, but they inflate the binary size and require a rebuild to update files. For frequently-changing content (user uploads, generated reports) stick with `StaticDir` pointing at a runtime path.
+</Tip>

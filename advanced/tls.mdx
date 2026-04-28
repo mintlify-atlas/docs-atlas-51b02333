@@ -1,0 +1,155 @@
+---
+title: "TLS and ACME in Salvo"
+description: "Enable HTTPS in Salvo with rustls, native-tls, or OpenSSL. Automate certificate issuance from Let's Encrypt using the ACME http01 or tls-alpn01 challenge."
+---
+
+Salvo supports HTTPS through several TLS backends. You can load certificates manually with `rustls`, or let Salvo obtain and renew certificates automatically from Let's Encrypt via the ACME protocol. Both approaches share the same `TcpListener` builder API, so switching between them requires minimal code changes.
+
+## Feature flags
+
+Add the appropriate feature flag to your `Cargo.toml` depending on the TLS backend you want to use.
+
+```toml
+[dependencies]
+salvo = { version = "*", features = ["rustls"] }        # rustls backend
+# salvo = { version = "*", features = ["native-tls"] }  # native-tls backend
+# salvo = { version = "*", features = ["openssl"] }     # OpenSSL backend
+```
+
+For automatic certificate management via ACME, enable the `acme` feature instead:
+
+```toml
+[dependencies]
+salvo = { version = "*", features = ["acme"] }
+```
+
+## Manual TLS with rustls
+
+The `rustls` feature exposes `RustlsConfig` and `Keycert`. Build a config by pointing it at your PEM-encoded certificate and private key, then chain `.rustls(config)` onto a `TcpListener` before calling `.bind()`.
+
+```rust
+use salvo::conn::rustls::{Keycert, RustlsConfig};
+use salvo::prelude::*;
+
+#[handler]
+async fn hello(res: &mut Response) {
+    res.render(Text::Plain("Hello World"));
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt().init();
+
+    let router = Router::new().get(hello);
+
+    let config = RustlsConfig::new(
+        Keycert::new()
+            .cert(include_bytes!("../certs/cert.pem").as_ref())
+            .key(include_bytes!("../certs/key.pem").as_ref()),
+    );
+
+    let acceptor = TcpListener::new("0.0.0.0:443")
+        .rustls(config)
+        .bind()
+        .await;
+
+    Server::new(acceptor).serve(router).await;
+}
+```
+
+<Note>
+`include_bytes!` embeds the certificate at compile time. For hot-reload support you can read the files at runtime and rebuild `RustlsConfig` on a file-watch event without restarting the process.
+</Note>
+
+## ACME — automatic certificates from Let's Encrypt
+
+The `acme` feature enables the `.acme()` builder on `TcpListener`. Salvo handles domain validation, certificate issuance, and renewal automatically. Certificates are cached on disk so they survive restarts.
+
+### HTTP-01 challenge
+
+The HTTP-01 challenge proves domain ownership over plain HTTP on port 80. Salvo injects the required challenge routes into your router automatically via `.http01_challenge(&mut router)`. The listener then joins port 80 and port 443 so both are served.
+
+```rust
+use salvo::prelude::*;
+
+#[handler]
+async fn hello() -> &'static str {
+    "Hello World"
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt().init();
+
+    let mut router = Router::new().get(hello);
+
+    let listener = TcpListener::new("0.0.0.0:443")
+        .acme()
+        // Switch to staging during development to avoid rate limits:
+        // .directory("letsencrypt", salvo::conn::acme::LETS_ENCRYPT_STAGING)
+        .cache_path("/var/cache/letsencrypt")
+        .add_domain("example.com")           // replace with your domain
+        .http01_challenge(&mut router);      // injects /.well-known/acme-challenge routes
+
+    // Join port 80 so the HTTP-01 challenge responder is reachable
+    let acceptor = listener.join(TcpListener::new("0.0.0.0:80")).bind().await;
+
+    Server::new(acceptor).serve(router).await;
+}
+```
+
+<Warning>
+Your server must be publicly reachable on port 80 for the HTTP-01 challenge to succeed. Firewall rules and reverse proxies that strip `/.well-known/acme-challenge` paths will cause certificate issuance to fail.
+</Warning>
+
+### TLS-ALPN-01 challenge
+
+The TLS-ALPN-01 challenge avoids the need for port 80 entirely — validation happens over TLS on port 443. Replace `.http01_challenge` with `.tls_alpn01_challenge` and drop the port-80 join:
+
+```rust
+let listener = TcpListener::new("0.0.0.0:443")
+    .acme()
+    .cache_path("/var/cache/letsencrypt")
+    .add_domain("example.com")
+    .tls_alpn01_challenge();
+
+let acceptor = listener.bind().await;
+Server::new(acceptor).serve(router).await;
+```
+
+## Combining ACME with HTTP/3 (QUIC)
+
+Enable both `acme` and `quinn` features to serve HTTP/3 alongside HTTPS. Chain `.quinn(addr)` directly on the ACME listener builder so a single `Server` handles all three protocol versions.
+
+```toml
+[dependencies]
+salvo = { version = "*", features = ["acme", "quinn"] }
+```
+
+```rust
+use salvo::prelude::*;
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt().init();
+
+    let mut router = Router::new().get(hello);
+
+    // .quinn() enables HTTP/3 on the same port alongside ACME-managed HTTPS
+    let listener = TcpListener::new("0.0.0.0:443")
+        .acme()
+        .cache_path("temp/letsencrypt")
+        .add_domain("example.com") // replace with your domain
+        .http01_challenge(&mut router)
+        .quinn("0.0.0.0:443");
+
+    // Join port 80 for the HTTP-01 challenge responder
+    let acceptor = listener.join(TcpListener::new("0.0.0.0:80")).bind().await;
+
+    Server::new(acceptor).serve(router).await;
+}
+```
+
+<Tip>
+During local development, always use the Let's Encrypt **staging** environment (`.directory("letsencrypt", salvo::conn::acme::LETS_ENCRYPT_STAGING)`) to avoid hitting the production rate limit of 5 certificates per domain per week.
+</Tip>

@@ -1,0 +1,194 @@
+---
+title: "Compression and caching headers in Salvo"
+description: "Enable brotli, gzip, deflate, and zstd compression in Salvo. Add ETag and Last-Modified caching support using the compression and caching-headers features."
+---
+
+Two complementary performance middlewares ship with Salvo: `Compression` shrinks response bodies on the wire by negotiating an encoding algorithm with the client, while `CachingHeaders` adds `ETag` and `Last-Modified` support so clients can skip re-downloading resources they already have.
+
+---
+
+## Compression
+
+### Feature flag
+
+```toml
+[dependencies]
+salvo = { version = "*", features = [
+    "compression",
+    "gzip",     # gzip algorithm
+    "brotli",   # brotli algorithm
+    "deflate",  # deflate algorithm
+    "zstd",     # zstd algorithm
+] }
+```
+
+Enable only the algorithms your deployment requires; each adds a dependency.
+
+### Supported algorithms
+
+| Algorithm | `Content-Encoding` | Feature |
+|-----------|--------------------|---------|
+| Gzip | `gzip` | `gzip` |
+| Brotli | `br` | `brotli` |
+| Deflate | `deflate` | `deflate` |
+| Zstd | `zstd` | `zstd` |
+
+### Basic setup
+
+`Compression::new()` returns a middleware with all compiled-in algorithms enabled at `CompressionLevel::Default` and a minimum body size of 1 KB. Attach it with `.hoop()`:
+
+```rust
+use salvo::prelude::*;
+
+let compression = Compression::new();
+let router = Router::with_hoop(compression).get(hello);
+```
+
+### Builder API
+
+```rust
+use salvo::prelude::*;
+
+let compression = Compression::new()
+    .disable_all()                            // start from scratch
+    .enable_brotli(CompressionLevel::Default) // add brotli
+    .enable_gzip(CompressionLevel::Fastest)   // add gzip (fastest = lower CPU)
+    .min_length(1024)                         // skip bodies < 1 KB
+    .force_priority(false);                   // respect client's Accept-Encoding order
+```
+
+### Compression levels
+
+| Level | Trade-off |
+|-------|-----------|
+| `CompressionLevel::Fastest` | Lowest CPU use, larger output |
+| `CompressionLevel::Default` | Balanced (recommended) |
+| `CompressionLevel::Minsize` | Smallest output, highest CPU use |
+| `CompressionLevel::Precise(n)` | Algorithm-specific numeric level |
+
+### Algorithm negotiation
+
+The middleware reads the client's `Accept-Encoding` header and selects the best algorithm both sides support. By default it honours the client's quality (`q`) preferences. Set `.force_priority(true)` to use the server's configured order instead:
+
+```rust
+// Server will always prefer brotli even if the client listed gzip first
+let compression = Compression::new()
+    .disable_all()
+    .enable_brotli(CompressionLevel::Default)
+    .enable_gzip(CompressionLevel::Default)
+    .force_priority(true);
+```
+
+### Customising compressed content types
+
+By default the middleware compresses `text/*`, `application/javascript`, `application/json`, `application/xml`, `application/wasm`, `image/svg+xml`, and `application/rss+xml`. Override the list with `.content_types()`:
+
+```rust
+use salvo::http::mime;
+
+let compression = Compression::new()
+    .content_types(&[mime::TEXT_HTML, mime::APPLICATION_JSON]);
+```
+
+### Full example
+
+```rust
+use salvo::prelude::*;
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt().init();
+
+    let base_dir = std::env::current_dir().unwrap().join("static");
+
+    let router = Router::new()
+        // Brotli for SSE chat
+        .push(
+            Router::with_hoop(Compression::new().enable_brotli(CompressionLevel::Fastest))
+                .path("sse_chat")
+                .get(StaticFile::new(base_dir.join("sse_chat.txt"))),
+        )
+        // Zstd for todos API
+        .push(
+            Router::with_hoop(Compression::new().enable_zstd(CompressionLevel::Fastest))
+                .path("todos")
+                .get(StaticFile::new(base_dir.join("todos.txt"))),
+        )
+        // Gzip fallback for everything else
+        .push(
+            Router::with_hoop(Compression::new().enable_gzip(CompressionLevel::Fastest))
+                .path("{*path}")
+                .get(StaticDir::new(base_dir)),
+        );
+
+    let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
+    Server::new(acceptor).serve(router).await;
+}
+```
+
+---
+
+## Caching headers
+
+### Feature flag
+
+```toml
+[dependencies]
+salvo = { version = "*", features = ["caching-headers"] }
+```
+
+`CachingHeaders` combines two handlers:
+
+- **`ETag`** — computes a hash of the response body and sets the `ETag` header. On subsequent requests it compares the client's `If-None-Match` value and returns `304 Not Modified` with an empty body if they match.
+- **`Modified`** — reads the `Last-Modified` header set by other handlers (such as static file serving) and compares it with the client's `If-Modified-Since` header, returning `304 Not Modified` when appropriate.
+
+### Setup
+
+```rust
+use salvo::caching_headers::CachingHeaders;
+use salvo::prelude::*;
+
+#[handler]
+async fn hello() -> &'static str {
+    "Hello World"
+}
+
+let router = Router::with_hoop(CachingHeaders::new()).get(hello);
+```
+
+The first response includes an `ETag` header:
+
+```
+HTTP/1.1 200 OK
+ETag: "abc123…"
+```
+
+A subsequent request with `If-None-Match: "abc123…"` receives:
+
+```
+HTTP/1.1 304 Not Modified
+```
+
+### Using `ETag` and `Modified` separately
+
+If you need only one behaviour, use `ETag` or `Modified` individually:
+
+```rust
+use salvo::caching_headers::{ETag, Modified};
+
+// ETag only, using strong comparison
+let router = Router::with_hoop(ETag::new().strong()).get(handler);
+
+// Last-Modified only
+let router = Router::with_hoop(Modified::new()).get(handler);
+```
+
+<Tip>
+`CachingHeaders` is most effective when combined with static file serving. `StaticDir` and `StaticFile` already set `Last-Modified` from the file's mtime, so adding `CachingHeaders` gives you both ETag and `If-Modified-Since` support with no extra code:
+
+```rust
+let router = Router::with_hoop(CachingHeaders::new())
+    .path("{*path}")
+    .get(StaticDir::new("public").defaults("index.html"));
+```
+</Tip>

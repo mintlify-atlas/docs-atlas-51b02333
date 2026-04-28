@@ -1,0 +1,168 @@
+---
+title: "WebSocket and SSE in Salvo"
+description: "Add real-time communication to Salvo apps with WebSocket upgrades and Server-Sent Events using the websocket and sse feature flags."
+---
+
+Salvo provides first-class support for two real-time communication patterns: WebSocket for full-duplex messaging and Server-Sent Events (SSE) for one-way server-to-client streams. Both are enabled by feature flags and integrate naturally with the standard handler and router APIs.
+
+## WebSocket
+
+### Feature flag
+
+```toml
+[dependencies]
+salvo = { version = "*", features = ["websocket"] }
+```
+
+### Upgrading a connection
+
+A WebSocket handler calls `WebSocketUpgrade::new().upgrade(req, res, callback)`. The callback receives a `WebSocket` value that exposes an async `recv()` stream and a `send()` sink. The upgrade must be registered on a route using `.goal()` rather than `.get()`, because the HTTP connection transitions protocols.
+
+```rust
+use salvo::prelude::*;
+use salvo::websocket::WebSocketUpgrade;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct User {
+    id: usize,
+    name: String,
+}
+
+#[handler]
+async fn connect(req: &mut Request, res: &mut Response) -> Result<(), StatusError> {
+    // Parse any query parameters before upgrading
+    let user = req.parse_queries::<User>();
+
+    WebSocketUpgrade::new()
+        .upgrade(req, res, |mut ws| async move {
+            println!("{user:#?}");
+
+            while let Some(msg) = ws.recv().await {
+                let msg = match msg {
+                    Ok(m) => m,
+                    Err(_) => return, // client disconnected
+                };
+
+                if ws.send(msg).await.is_err() {
+                    return; // client disconnected
+                }
+            }
+        })
+        .await
+}
+```
+
+### Registering the route
+
+Use `.goal()` instead of `.get()` on routes that perform a protocol upgrade.
+
+```rust
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt().init();
+
+    let router = Router::new()
+        .get(index)
+        .push(Router::with_path("ws").goal(connect));
+
+    let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
+    Server::new(acceptor).serve(router).await;
+}
+```
+
+### Sending and receiving messages
+
+Inside the upgrade callback, `ws.recv().await` yields `Option<Result<Message, Error>>`. A `None` means the client closed the connection cleanly. An `Err` variant means a protocol error occurred. Call `ws.send(msg).await` to write a message back; an error return also signals disconnection.
+
+```rust
+// Echo loop pattern
+while let Some(Ok(msg)) = ws.recv().await {
+    if ws.send(msg).await.is_err() {
+        break;
+    }
+}
+```
+
+## Server-Sent Events (SSE)
+
+### Feature flag
+
+```toml
+[dependencies]
+salvo = { version = "*", features = ["sse"] }
+```
+
+### Streaming events
+
+An SSE handler builds an async `Stream` of `Result<SseEvent, E>` values and passes it to `sse::stream(res, stream)`. Each `SseEvent` can carry a `text`, `data`, `id`, and `event` name field. The response is held open for as long as the stream continues to produce items.
+
+```rust
+use std::convert::Infallible;
+use std::time::Duration;
+
+use futures_util::StreamExt;
+use salvo::prelude::*;
+use salvo::sse::{self, SseEvent};
+use tokio::time::interval;
+use tokio_stream::wrappers::IntervalStream;
+
+fn sse_counter(counter: u64) -> Result<SseEvent, Infallible> {
+    Ok(SseEvent::default().text(counter.to_string()))
+}
+
+#[handler]
+async fn handle_tick(res: &mut Response) {
+    let event_stream = {
+        let mut counter: u64 = 0;
+        let interval = interval(Duration::from_secs(1));
+        let stream = IntervalStream::new(interval);
+        stream.map(move |_| {
+            counter += 1;
+            sse_counter(counter)
+        })
+    };
+    sse::stream(res, event_stream);
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt().init();
+
+    let router = Router::with_path("ticks").get(handle_tick);
+
+    let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
+    Server::new(acceptor).serve(router).await;
+}
+```
+
+### Keep-alive
+
+For long-lived SSE connections that may have no events for extended periods, send periodic comment frames to prevent proxies and load balancers from closing the idle connection:
+
+```rust
+use salvo::sse::SseKeepAlive;
+
+#[handler]
+async fn handle_events(res: &mut Response) {
+    let event_stream = make_event_stream();
+    // Wrap with keep-alive: sends a comment every 15 seconds
+    sse::stream(res, SseKeepAlive::new(event_stream).interval(Duration::from_secs(15)));
+}
+```
+
+<Note>
+SSE requires HTTP/1.1 or HTTP/2. With HTTP/2, a single multiplexed connection can carry many independent SSE streams simultaneously without the browser's per-host connection limit that affects HTTP/1.1.
+</Note>
+
+## Choosing between WebSocket and SSE
+
+| | WebSocket | SSE |
+|---|---|---|
+| Direction | Full-duplex | Server → client only |
+| Protocol | `ws://` / `wss://` | Plain HTTP |
+| Browser reconnect | Manual | Automatic |
+| HTTP/2 multiplexing | No | Yes |
+| Proxy compatibility | Variable | High |
+
+Use WebSocket when clients need to send frequent messages. Use SSE when you only need to push updates from the server — it is simpler to implement and works through more proxies without configuration.

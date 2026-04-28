@@ -1,0 +1,95 @@
+{
+  "projectType": "framework",
+  "projectName": "Salvo",
+  "projectDescription": "A powerful and simple async Rust web framework built on Hyper and Tokio, featuring tree-based routing, middleware-as-handlers, first-class OpenAPI support, and built-in TLS/HTTP3.",
+  "theme": "palm",
+  "primaryColor": "#1476bd",
+  "lightColor": "#1c9655",
+  "darkColor": null,
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "concepts"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "core/handlers",
+              "core/routing",
+              "core/middleware",
+              "core/request-response",
+              "core/depot"
+            ]
+          },
+          {
+            "group": "Middleware & Features",
+            "pages": [
+              "middleware/auth",
+              "middleware/cors-csrf",
+              "middleware/sessions-flash",
+              "middleware/rate-limiting",
+              "middleware/compression-caching",
+              "middleware/static-files"
+            ]
+          },
+          {
+            "group": "Advanced Topics",
+            "pages": [
+              "advanced/tls",
+              "advanced/openapi",
+              "advanced/websocket-sse",
+              "advanced/proxy",
+              "advanced/testing",
+              "advanced/deployment"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Handler-based middleware (no complex traits or generics)",
+    "Tree-based routing with per-branch middleware",
+    "First-class OpenAPI support via #[endpoint] macro",
+    "HTTP/1, HTTP/2, and HTTP/3 (QUIC) support",
+    "Auto TLS via ACME (Let's Encrypt)",
+    "WebSocket and WebTransport support",
+    "JWT authentication middleware",
+    "Built-in rate limiting, CORS, CSRF, sessions",
+    "Async-first, built on Hyper and Tokio",
+    "Zero unsafe code"
+  ],
+  "publicApiSurface": [
+    "Router",
+    "Handler (#[handler] macro)",
+    "#[endpoint] macro (OpenAPI)",
+    "Depot",
+    "Request",
+    "Response",
+    "FlowCtrl",
+    "TcpListener / RustlsListener / QuinnListener / AcmeListener",
+    "Server",
+    "Service",
+    "Scribe / Writer",
+    "JwtAuth",
+    "BasicAuth",
+    "CorsHandler",
+    "CsrfHandler",
+    "SessionHandler",
+    "RateLimiter",
+    "Compression",
+    "Proxy",
+    "StaticDir / StaticFile",
+    "WebSocketUpgrade",
+    "SseEvent / SseKeepAlive",
+    "OpenApi / SwaggerUi / RapiDoc / ReDoc / Scalar"
+  ]
+}

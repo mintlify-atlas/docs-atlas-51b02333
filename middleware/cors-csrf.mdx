@@ -1,0 +1,284 @@
+---
+title: "CORS and CSRF protection in Salvo"
+description: "Configure CORS with Salvo's builder API and add CSRF token protection using cookie or session stores. Covers the cors and csrf feature flags and token finders."
+---
+
+Browser security imposes two distinct threat surfaces that Salvo addresses with dedicated middleware: CORS (Cross-Origin Resource Sharing) for controlling which origins may call your API from JavaScript, and CSRF (Cross-Site Request Forgery) for ensuring that state-mutating requests originate from your own pages. This page covers both.
+
+---
+
+## CORS
+
+### Feature flag
+
+```toml
+[dependencies]
+salvo = { version = "*", features = ["cors"] }
+```
+
+### Configuration
+
+Build a `Cors` value with the builder API, then call `.into_handler()` to convert it to a Salvo handler:
+
+```rust
+use salvo::cors::Cors;
+use salvo::http::Method;
+use salvo::prelude::*;
+
+let cors = Cors::new()
+    .allow_origin(["http://127.0.0.1:8698", "http://localhost:8698"])
+    .allow_methods(vec![Method::GET, Method::POST, Method::DELETE])
+    .allow_headers("authorization")
+    .into_handler();
+```
+
+| Builder method | HTTP header set | Accepts |
+|----------------|-----------------|---------|
+| `.allow_origin(…)` | `Access-Control-Allow-Origin` | string, array, `Any`, closure |
+| `.allow_methods(…)` | `Access-Control-Allow-Methods` | `Vec<Method>`, `Any` |
+| `.allow_headers(…)` | `Access-Control-Allow-Headers` | string, array, `Any` |
+| `.allow_credentials(true)` | `Access-Control-Allow-Credentials` | `bool` |
+| `.expose_headers(…)` | `Access-Control-Expose-Headers` | string, array, `Any` |
+| `.max_age(seconds)` | `Access-Control-Max-Age` | `u64`, `Duration` |
+
+### Attaching to `Service`
+
+<Warning>
+CORS **must** be attached to `Service`, not to `Router`. Browsers send `OPTIONS` preflight requests that do not match any route; only `Service`-level middleware can intercept them.
+</Warning>
+
+```rust
+let router = Router::with_path("hello").post(hello);
+let service = Service::new(router).hoop(cors);
+```
+
+### Full example
+
+```rust
+use salvo::cors::Cors;
+use salvo::http::Method;
+use salvo::prelude::*;
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt().init();
+    tokio::join!(backend_server(), frontend_server());
+}
+
+async fn backend_server() {
+    #[handler]
+    async fn hello() -> &'static str {
+        "hello, I am content from remote server."
+    }
+
+    let cors = Cors::new()
+        .allow_origin(["http://127.0.0.1:8698", "http://localhost:8698"])
+        .allow_methods(vec![Method::GET, Method::POST, Method::DELETE])
+        .allow_headers("authorization")
+        .into_handler();
+
+    let router = Router::with_path("hello").post(hello);
+    let service = Service::new(router).hoop(cors);
+
+    let acceptor = TcpListener::new("0.0.0.0:5600").bind().await;
+    Server::new(acceptor).serve(service).await;
+}
+
+async fn frontend_server() {
+    #[handler]
+    async fn index() -> Text<&'static str> {
+        Text::Html(HTML_DATA)
+    }
+
+    let router = Router::new().get(index);
+    let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
+    Server::new(acceptor).serve(router).await;
+}
+
+const HTML_DATA: &str = r#"<!DOCTYPE html>
+<html><head><title>Salvo CORS</title></head>
+<body>
+<button id="btn">Load Content</button>
+<div id="content"></div>
+<script>
+document.getElementById("btn").addEventListener("click", function() {
+    fetch("http://127.0.0.1:5600/hello", {
+        method: "POST",
+        headers: { authorization: "abcdef" }
+    }).then(r => r.text()).then(data => {
+        document.getElementById("content").innerHTML = data;
+    });
+});
+</script>
+</body></html>"#;
+```
+
+<Tip>
+Apply CORS at the `Service` level for global rules. If different routes need different CORS policies (for example, a public read-only API vs. an authenticated write API), create multiple `Service` instances on separate ports or use `AllowOrigin::dynamic` / `AllowOrigin::dynamic_async` to inspect the request and decide per-call.
+</Tip>
+
+---
+
+## CSRF
+
+### Feature flag
+
+```toml
+[dependencies]
+salvo = { version = "*", features = ["csrf"] }
+```
+
+The `csrf` crate supports multiple cipher/store combinations. Enable the sub-features you need:
+
+```toml
+salvo = { version = "*", features = [
+    "csrf",
+    # Choose one or more ciphers:
+    "bcrypt-cipher",   # bcrypt-based token
+    "hmac-cipher",     # HMAC-SHA256-based token
+    "aes-gcm-cipher",  # AES-GCM-based token
+    "ccp-cipher",      # ChaCha20Poly1305-based token
+    # Choose a store:
+    "cookie-store",    # store proof in a cookie
+    "session-store",   # store proof in the session (requires "session" feature)
+] }
+```
+
+### Token stores
+
+| Store | How the proof is persisted |
+|-------|---------------------------|
+| `CookieStore` | Signed cookie sent with every response |
+| `SessionStore` | Server-side session entry (requires session middleware) |
+
+### Token finders
+
+The finder tells the middleware where to look for the submitted CSRF token on incoming mutating requests (`POST`, `PUT`, `PATCH`, `DELETE`):
+
+| Finder | Where it reads from |
+|--------|---------------------|
+| `HeaderFinder::new("x-csrf-token")` | Custom request header |
+| `FormFinder::new("csrf_token")` | HTML form field |
+| `JsonFinder::new("csrf_token")` | JSON request body field |
+
+### Reading the token in a handler
+
+Use `CsrfDepotExt` to pull the token out of `Depot` and embed it in HTML responses:
+
+```rust
+use salvo::csrf::CsrfDepotExt;
+
+#[handler]
+pub async fn get_page(depot: &mut Depot, res: &mut Response) {
+    let csrf_token = depot.csrf_token().unwrap_or_default();
+    res.render(Text::Html(format!(
+        r#"<form method="post">
+             <input type="hidden" name="csrf_token" value="{csrf_token}" />
+             <button type="submit">Submit</button>
+           </form>"#
+    )));
+}
+```
+
+### Rotation policy
+
+```rust
+use salvo::csrf::CsrfRotationPolicy;
+
+// Default: reuse the same token across requests (works well with multiple tabs)
+let csrf = Csrf::new(cipher, store, finder);
+
+// Rotate the token after every accepted request
+let csrf = Csrf::new(cipher, store, finder)
+    .rotation_policy(CsrfRotationPolicy::PerRequest);
+```
+
+### Full example (cookie store)
+
+```rust
+use salvo::csrf::*;
+use salvo::prelude::*;
+use serde::{Deserialize, Serialize};
+
+#[handler]
+pub async fn home(res: &mut Response) {
+    res.render(Text::Html(r#"
+        <h2>CSRF Example: CookieStore</h2>
+        <ul>
+            <li><a href="/bcrypt/">Bcrypt</a></li>
+            <li><a href="/hmac/">HMAC</a></li>
+        </ul>
+    "#));
+}
+
+#[handler]
+pub async fn get_page(depot: &mut Depot, res: &mut Response) {
+    let csrf_token = depot.csrf_token().unwrap_or_default();
+    res.render(Text::Html(get_page_html(csrf_token, "")));
+}
+
+#[handler]
+pub async fn post_page(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    #[derive(Deserialize, Serialize, Debug)]
+    struct Data { csrf_token: String, message: String }
+
+    let data = req.parse_form::<Data>().await.unwrap();
+    tracing::info!("posted data: {:?}", data);
+    let csrf_token = depot.csrf_token().unwrap_or_default();
+    res.render(Text::Html(get_page_html(csrf_token, &format!("{data:#?}"))));
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt().init();
+
+    let form_finder = FormFinder::new("csrf_token");
+
+    let bcrypt_csrf = bcrypt_cookie_csrf(form_finder.clone());
+    let hmac_csrf = hmac_cookie_csrf(*b"01234567012345670123456701234567", form_finder.clone());
+
+    let router = Router::new()
+        .get(home)
+        .push(
+            Router::with_hoop(bcrypt_csrf)
+                .path("bcrypt")
+                .get(get_page)
+                .post(post_page),
+        )
+        .push(
+            Router::with_hoop(hmac_csrf)
+                .path("hmac")
+                .get(get_page)
+                .post(post_page),
+        );
+
+    let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
+    Server::new(acceptor).serve(router).await;
+}
+
+fn get_page_html(csrf_token: &str, msg: &str) -> String {
+    format!(r#"
+        <!DOCTYPE html>
+        <html><head><title>CSRF Example</title></head>
+        <body>
+          <form action="./" method="post">
+            <input type="hidden" name="csrf_token" value="{csrf_token}" />
+            <label>Message: <input type="text" name="message" /></label>
+            <button type="submit">Send</button>
+          </form>
+          <pre>{msg}</pre>
+        </body></html>
+    "#)
+}
+```
+
+<Note>
+When using `SessionStore` for CSRF, add the session middleware **before** the CSRF middleware in the hoop chain so the session is already populated when CSRF runs:
+
+```rust
+Router::new()
+    .hoop(session_handler)
+    .hoop(csrf_handler)
+    .get(handler)
+```
+</Note>

@@ -1,0 +1,286 @@
+---
+title: "Sessions and flash messages in Salvo"
+description: "Learn how to use cookie-backed sessions and one-time flash messages in Salvo for stateful user flows and redirect-after-post patterns."
+---
+
+Salvo provides two complementary mechanisms for carrying state across requests: sessions for persistent per-user data that lives for the duration of a browser session, and flash messages for one-shot notifications that survive exactly one redirect. Both integrate with the `Depot` type-map through extension traits.
+
+---
+
+## Sessions
+
+### Feature flag
+
+```toml
+[dependencies]
+salvo = { version = "*", features = ["session"] }
+```
+
+### Stores
+
+| Store | When to use |
+|-------|-------------|
+| `CookieStore` | Store the entire session in a signed cookie; zero server state, bounded size |
+| `MemoryStore` | In-process memory; suitable for development and single-instance deployments |
+| External stores | Redis, database-backed, etc. — see the `saysion` crate for adapters |
+
+### Building `SessionHandler`
+
+`SessionHandler` is constructed via a builder. The only required arguments are the backing store and a secret (at least 64 bytes) used to sign the session cookie.
+
+```rust
+use salvo::session::{CookieStore, SessionHandler};
+
+let session_handler = SessionHandler::builder(
+    CookieStore::new(),
+    b"secretabsecretabsecretabsecretabsecretabsecretabsecretabsecretab",
+)
+.cookie_name("my_session")          // default: "salvo.session.id"
+.session_ttl(Some(Duration::from_secs(24 * 60 * 60))) // default: 1 day
+.same_site_policy(SameSite::Lax)    // default: Lax
+.build()
+.unwrap();
+```
+
+Attach the handler to a router with `.hoop()`:
+
+```rust
+let router = Router::new()
+    .hoop(session_handler)
+    .get(home)
+    .push(Router::with_path("login").get(login).post(login))
+    .push(Router::with_path("logout").get(logout));
+```
+
+### Reading and writing session data
+
+Use `SessionDepotExt` to access the session from `Depot`:
+
+```rust
+use salvo::session::{Session, SessionDepotExt};
+
+// Write — insert a new session
+let mut session = Session::new();
+session.insert("username", "alice").unwrap();
+depot.set_session(session);
+
+// Read
+if let Some(session) = depot.session() {
+    let username: Option<String> = session.get("username");
+}
+
+// Mutate
+if let Some(session) = depot.session_mut() {
+    session.remove("username");
+    // or session.destroy() to delete the session entirely
+}
+```
+
+### Full example
+
+```rust
+use salvo::prelude::*;
+use salvo::session::{CookieStore, Session, SessionDepotExt, SessionHandler};
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt().init();
+
+    let session_handler = SessionHandler::builder(
+        CookieStore::new(),
+        b"secretabsecretabsecretabsecretabsecretabsecretabsecretabsecretab",
+    )
+    .build()
+    .unwrap();
+
+    let router = Router::new()
+        .hoop(session_handler)
+        .get(home)
+        .push(Router::with_path("login").get(login).post(login))
+        .push(Router::with_path("logout").get(logout));
+
+    let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
+    Server::new(acceptor).serve(router).await;
+}
+
+#[handler]
+pub async fn login(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    if req.method() == salvo::http::Method::POST {
+        let mut session = Session::new();
+        session
+            .insert("username", req.form::<String>("username").await.unwrap())
+            .unwrap();
+        depot.set_session(session);
+        res.render(Redirect::other("/"));
+    } else {
+        res.render(Text::Html(LOGIN_HTML));
+    }
+}
+
+#[handler]
+pub async fn logout(depot: &mut Depot, res: &mut Response) {
+    if let Some(session) = depot.session_mut() {
+        session.remove("username");
+    }
+    res.render(Redirect::other("/"));
+}
+
+#[handler]
+pub async fn home(depot: &mut Depot, res: &mut Response) {
+    let mut content = r#"<a href="login">Login</a>"#.into();
+    if let Some(session) = depot.session_mut()
+        && let Some(username) = session.get::<String>("username")
+    {
+        content = format!(r#"Hello, {username}. <a href="logout">Logout</a>"#);
+    }
+    res.render(Text::Html(content));
+}
+
+static LOGIN_HTML: &str = r#"<!DOCTYPE html>
+<html><head><title>Login</title></head>
+<body>
+  <form action="/login" method="post">
+    <input type="text" name="username" />
+    <button type="submit">Submit</button>
+  </form>
+</body></html>"#;
+```
+
+<Note>
+Any session store other than `CookieStore` will accumulate stale sessions over time. Call the store's cleanup method periodically, or configure TTL-based expiry in your storage backend.
+</Note>
+
+---
+
+## Flash messages
+
+### Feature flag
+
+```toml
+[dependencies]
+salvo = { version = "*", features = ["flash"] }
+```
+
+Flash messages are temporary notifications that survive exactly one redirect. The typical flow is:
+
+1. A handler sets a flash message on the outgoing `Depot`.
+2. The middleware saves the message (cookie or session) and the response redirects.
+3. On the next request the message appears as the *incoming* flash; the middleware clears it after the handler runs.
+
+### Stores
+
+| Store | Feature | Notes |
+|-------|---------|-------|
+| `CookieStore` | `cookie-store` | Serialises messages into a signed cookie |
+| `SessionStore` | `session-store` | Stores messages in the session (requires `session` feature) |
+
+### Setting up the handler
+
+```rust
+use salvo::flash::CookieStore;
+
+let flash_handler = CookieStore::new()
+    .name("my-flash-cookie") // optional custom cookie name
+    .into_handler();
+
+let router = Router::new()
+    .hoop(flash_handler)
+    .push(Router::with_path("submit").post(submit_form))
+    .push(Router::with_path("result").get(show_result));
+```
+
+### Setting and reading flash messages
+
+```rust
+use salvo::flash::FlashDepotExt;
+
+// Set — before a redirect
+#[handler]
+async fn submit_form(depot: &mut Depot, res: &mut Response) {
+    depot.outgoing_flash_mut().success("Form submitted!");
+    res.render(Redirect::other("/result"));
+}
+
+// Read — on the landing page
+#[handler]
+async fn show_result(depot: &mut Depot, res: &mut Response) {
+    if let Some(flash) = depot.incoming_flash() {
+        for msg in flash.iter() {
+            println!("{}: {}", msg.level, msg.value);
+        }
+    }
+    res.render(Text::Html("Result page"));
+}
+```
+
+### Message levels
+
+`Flash` messages carry a severity level used for UI styling:
+
+```rust
+depot.outgoing_flash_mut()
+    .debug("debug info")
+    .info("something to note")
+    .success("operation succeeded")
+    .warning("proceed with caution")
+    .error("something went wrong");
+```
+
+Levels in ascending order: `Debug < Info < Success < Warning < Error`.
+
+Filter out low-priority messages with `minimum_level`:
+
+```rust
+let mut handler = FlashHandler::new(CookieStore::new());
+handler.minimum_level(FlashLevel::Warning); // only Warning and Error are stored
+```
+
+### Full example
+
+```rust
+use salvo::flash::{CookieStore, FlashDepotExt};
+use salvo::prelude::*;
+
+#[handler]
+pub async fn set_flash(depot: &mut Depot, res: &mut Response) {
+    depot.outgoing_flash_mut()
+        .info("Hey there!")
+        .debug("How is it going?");
+    res.render(Redirect::other("/get"));
+}
+
+#[handler]
+pub async fn get_flash(depot: &mut Depot, _res: &mut Response) -> String {
+    let mut body = String::new();
+    if let Some(flash) = depot.incoming_flash() {
+        for message in flash.iter() {
+            body.push_str(&format!("{} - {}\n", message.value, message.level));
+        }
+    }
+    body
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt().init();
+
+    let router = Router::new()
+        .hoop(CookieStore::new().into_handler())
+        .push(Router::with_path("get").get(get_flash))
+        .push(Router::with_path("set").get(set_flash));
+
+    let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
+    Server::new(acceptor).serve(router).await;
+}
+```
+
+<Tip>
+When using `SessionStore` for flash, place the session middleware **before** the flash middleware so the session is available when flash messages are loaded and cleared:
+
+```rust
+Router::new()
+    .hoop(session_handler)
+    .hoop(SessionStore::new().into_handler())
+    .push(...)
+```
+</Tip>

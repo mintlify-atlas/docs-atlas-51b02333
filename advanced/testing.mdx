@@ -1,0 +1,161 @@
+---
+title: "Testing Salvo applications"
+description: "Write unit and integration tests for Salvo handlers and routes using the built-in test utilities without starting a real HTTP server."
+---
+
+Salvo includes a `test` module that lets you exercise handlers and routers directly in-process. No TCP socket is opened, no port needs to be free, and tests run as fast as regular unit tests. The API mirrors a real HTTP client so your test code reads naturally.
+
+## Feature flag
+
+The `test` feature is enabled by default. If you have disabled default features, re-enable it explicitly:
+
+```toml
+[dependencies]
+salvo = { version = "*", features = ["test"] }
+```
+
+## TestClient basics
+
+`TestClient` provides one static method per HTTP verb. Each method returns a `RequestBuilder` that you configure, then call `.send(service)` to dispatch the request through the router in-process.
+
+```rust
+use salvo::test::TestClient;
+
+// Available methods
+TestClient::get("http://localhost/path")
+TestClient::post("http://localhost/path")
+TestClient::put("http://localhost/path")
+TestClient::patch("http://localhost/path")
+TestClient::delete("http://localhost/path")
+TestClient::head("http://localhost/path")
+TestClient::options("http://localhost/path")
+```
+
+The URL scheme and host are ignored — only the path and query string are used for routing. Using `http://localhost` is a convention that keeps URLs readable.
+
+## Building a service from a router
+
+Pass your `Router` directly to `.send()`. Salvo wraps it in a `Service` internally.
+
+```rust
+fn route() -> Router {
+    Router::new()
+        .push(Router::new().get(index))
+        .push(Router::new().path("todos").push(todo_route()))
+}
+
+fn todo_route() -> Router {
+    Router::new()
+        .get(list_todos)
+        .post(create_todo)
+        .push(Router::with_path("{id}").put(update_todo).delete(delete_todo))
+}
+```
+
+## Writing a test
+
+The example below tests the `POST /todos` endpoint from the todos application. It sends a JSON body, asserts the status code on the first request, then confirms that sending the same todo again returns a conflict:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use salvo::http::StatusCode;
+    use salvo::test::TestClient;
+
+    use super::models::Todo;
+
+    #[tokio::test]
+    async fn test_todo_create() {
+        // First creation should succeed with 201 Created
+        let res = TestClient::post("http://localhost/todos")
+            .json(&test_todo())
+            .send(super::route())
+            .await;
+
+        assert_eq!(res.status_code.unwrap(), StatusCode::CREATED);
+
+        // Duplicate ID should return 400 Bad Request
+        let res = TestClient::post("http://localhost/todos")
+            .json(&test_todo())
+            .send(super::route())
+            .await;
+
+        assert_eq!(res.status_code.unwrap(), StatusCode::BAD_REQUEST);
+    }
+
+    fn test_todo() -> Todo {
+        Todo {
+            id: 1,
+            text: "test todo".into(),
+            completed: false,
+        }
+    }
+}
+```
+
+## Sending request bodies
+
+<CodeGroup>
+
+```rust JSON body
+let res = TestClient::post("http://localhost/todos")
+    .json(&todo)          // serializes to JSON, sets Content-Type
+    .send(route())
+    .await;
+```
+
+```rust Form body
+let res = TestClient::post("http://localhost/login")
+    .form(&[("username", "alice"), ("password", "secret")])
+    .send(route())
+    .await;
+```
+
+```rust Raw bytes
+let res = TestClient::post("http://localhost/upload")
+    .body("raw bytes here")
+    .send(route())
+    .await;
+```
+
+</CodeGroup>
+
+## Reading the response
+
+The `Response` returned by `.send()` exposes the status code as `res.status_code` and provides async helpers for reading the body:
+
+```rust
+use salvo::test::ResponseExt;
+
+let mut res = TestClient::get("http://localhost/todos")
+    .send(route())
+    .await;
+
+// Status code
+assert_eq!(res.status_code.unwrap(), StatusCode::OK);
+
+// Body as String
+let body = res.take_string().await.unwrap();
+assert!(body.contains("Buy coffee"));
+
+// Body deserialized from JSON
+let todos: Vec<Todo> = res.take_json().await.unwrap();
+assert_eq!(todos[0].id, 1);
+```
+
+## Adding headers
+
+```rust
+let res = TestClient::get("http://localhost/protected")
+    .add_header("Authorization", "Bearer token123", true)
+    .send(route())
+    .await;
+```
+
+<Note>
+Each call to `.send()` creates a fresh in-process request pipeline. There is no persistent state between calls unless your handlers share global state (such as a `LazyLock<Mutex<Vec<Todo>>>`). Use separate `LazyLock` instances or reset shared state between tests to avoid inter-test interference.
+</Note>
+
+<Tip>
+Separate the router construction into a standalone `route()` function (as shown above) so both `main` and your test module can call it. This avoids duplicating route definitions and keeps the server startup logic out of test code.
+</Tip>

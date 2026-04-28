@@ -1,0 +1,193 @@
+---
+title: "OpenAPI documentation with Salvo"
+description: "Auto-generate OpenAPI 3 specs in Salvo by replacing #[handler] with #[endpoint], then serve Swagger UI, RapiDoc, ReDoc, or Scalar."
+---
+
+Salvo can generate an OpenAPI 3 specification directly from your route handlers with almost no extra boilerplate. The key change is replacing the `#[handler]` macro with `#[endpoint]`. From that point Salvo inspects your function signatures, extracts parameter and response type information, and builds a live spec that you can serve through any of the bundled UI renderers.
+
+## Feature flag
+
+```toml
+[dependencies]
+salvo = { version = "*", features = ["oapi"] }
+```
+
+## `#[endpoint]` vs `#[handler]`
+
+Both macros turn an async function into a Salvo handler. The difference is that `#[endpoint]` additionally registers the function's inputs and outputs into the OpenAPI schema graph.
+
+| | `#[handler]` | `#[endpoint]` |
+|---|---|---|
+| Handles HTTP requests | yes | yes |
+| Appears in OpenAPI spec | no | yes |
+| Supports `tags`, `status_codes` attributes | no | yes |
+
+Switching is a one-line change per handler.
+
+## A minimal example
+
+```rust
+use salvo::oapi::extract::*;
+use salvo::prelude::*;
+
+#[endpoint]
+async fn hello(name: QueryParam<String, false>) -> String {
+    format!("Hello, {}!", name.as_deref().unwrap_or("World"))
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt().init();
+
+    let router = Router::new().push(Router::with_path("hello").get(hello));
+
+    // Build the spec by walking the router tree
+    let doc = OpenApi::new("test api", "0.0.1").merge_router(&router);
+
+    let router = router
+        .unshift(doc.into_router("/api-doc/openapi.json"))
+        .unshift(SwaggerUi::new("/api-doc/openapi.json").into_router("/swagger-ui"));
+
+    let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
+    Server::new(acceptor).serve(router).await;
+}
+```
+
+`QueryParam<String, false>` is a typed extractor from `salvo::oapi::extract`. The second generic argument controls whether the parameter is required (`true`) or optional (`false`). Salvo uses this information to mark the field as required or nullable in the generated spec.
+
+## Deriving `ToSchema` for request and response types
+
+Any struct used as a request body or response body must implement `ToSchema` so Salvo can include its shape in the `components/schemas` section of the spec.
+
+```rust
+use salvo::oapi::ToSchema;
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
+#[salvo(schema(name = "Todo"))]
+pub struct Todo {
+    #[salvo(schema(example = 1))]
+    pub id: u64,
+    #[salvo(schema(example = "Buy coffee"))]
+    pub text: String,
+    pub completed: bool,
+}
+```
+
+The `#[salvo(schema(...))]` attribute accepts `name`, `example`, `description`, and other OpenAPI schema fields.
+
+## Path and query parameters with `ToParameters`
+
+Use the typed extractors from `salvo::oapi::extract` directly in your handler signature. `PathParam<T>` maps to a path parameter and `QueryParam<T, REQUIRED>` maps to a query parameter. Both are reflected automatically in the spec.
+
+```rust
+use salvo::oapi::extract::*;
+use salvo::prelude::*;
+
+/// Update existing todo.
+#[endpoint(tags("todos"), status_codes(200, 404))]
+pub async fn update_todo(
+    id: PathParam<u64>,
+    updated: JsonBody<Todo>,
+) -> Result<StatusCode, StatusError> {
+    // ...
+}
+```
+
+The `tags` and `status_codes` arguments on `#[endpoint]` populate the OpenAPI operation object directly.
+
+## Full CRUD example with `OpenApi::merge_router`
+
+```rust
+use salvo::oapi::extract::*;
+use salvo::prelude::*;
+
+/// List todos.
+#[endpoint(
+    tags("todos"),
+    parameters(
+        ("offset", description = "Offset is an optional query parameter."),
+    )
+)]
+pub async fn list_todos(
+    offset: QueryParam<usize, false>,
+    limit: QueryParam<usize, false>,
+) -> Json<Vec<Todo>> {
+    let todos = STORE.lock().await;
+    let todos: Vec<Todo> = todos
+        .clone()
+        .into_iter()
+        .skip(offset.into_inner().unwrap_or(0))
+        .take(limit.into_inner().unwrap_or(usize::MAX))
+        .collect();
+    Json(todos)
+}
+
+/// Create new todo.
+#[endpoint(tags("todos"), status_codes(201, 409))]
+pub async fn create_todo(req: JsonBody<Todo>) -> Result<StatusCode, StatusError> {
+    let mut vec = STORE.lock().await;
+    for todo in vec.iter() {
+        if todo.id == req.id {
+            return Err(StatusError::bad_request().brief("todo already exists"));
+        }
+    }
+    vec.push(req.into_inner());
+    Ok(StatusCode::CREATED)
+}
+
+/// Delete todo.
+#[endpoint(tags("todos"), status_codes(200, 401, 404))]
+pub async fn delete_todo(id: PathParam<u64>) -> Result<StatusCode, StatusError> {
+    let mut vec = STORE.lock().await;
+    let len = vec.len();
+    vec.retain(|todo| todo.id != *id);
+    if vec.len() != len {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(StatusError::not_found())
+    }
+}
+```
+
+## Serving UI renderers
+
+`OpenApi::merge_router` produces a router that serves the raw JSON spec. Pass the spec URL to any of the four built-in renderers and mount them with `.unshift`.
+
+```rust
+let doc = OpenApi::new("todos api", "0.0.1").merge_router(&router);
+
+let router = router
+    .unshift(doc.into_router("/api-doc/openapi.json"))
+    .unshift(
+        SwaggerUi::new("/api-doc/openapi.json")
+            .title("Todos - SwaggerUI")
+            .into_router("/swagger-ui"),
+    )
+    .unshift(
+        Scalar::new("/api-doc/openapi.json")
+            .title("Todos - Scalar")
+            .into_router("/scalar"),
+    )
+    .unshift(
+        RapiDoc::new("/api-doc/openapi.json")
+            .title("Todos - RapiDoc")
+            .into_router("/rapidoc"),
+    )
+    .unshift(
+        ReDoc::new("/api-doc/openapi.json")
+            .title("Todos - ReDoc")
+            .into_router("/redoc"),
+    );
+```
+
+| Renderer | Mount path | Notes |
+|---|---|---|
+| `SwaggerUi` | `/swagger-ui` | Try-it-out support |
+| `Scalar` | `/scalar` | Modern, minimal design |
+| `RapiDoc` | `/rapidoc` | Web component, themeable |
+| `ReDoc` | `/redoc` | Three-panel layout |
+
+<Tip>
+You can mount all four renderers at the same time. Each reads the same `/api-doc/openapi.json` endpoint, so there is no extra overhead.
+</Tip>

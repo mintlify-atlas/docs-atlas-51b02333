@@ -1,0 +1,127 @@
+---
+title: "Reverse proxy with Salvo"
+description: "Use Salvo's Proxy middleware to forward requests to upstream services, with support for path rewriting and custom client configuration."
+---
+
+Salvo ships a built-in reverse proxy middleware that can forward incoming requests to one or more upstream URLs. It integrates directly with the router so you can proxy specific path prefixes or host-based rules without any external tooling.
+
+## Feature flag
+
+```toml
+[dependencies]
+salvo = { version = "*", features = ["proxy"] }
+```
+
+## Basic upstream proxy
+
+`Proxy::use_hyper_client(upstream)` creates a handler that forwards every matched request to the given upstream URL. Attach it to a route with `.goal()` so the full remaining path is passed through.
+
+```rust
+use salvo::prelude::*;
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt().init();
+
+    let router = Router::new()
+        .push(
+            Router::new()
+                .path("{**rest}")
+                .goal(Proxy::use_hyper_client("https://docs.rs")),
+        );
+
+    let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
+    Server::new(acceptor).serve(router).await;
+}
+```
+
+The `{**rest}` wildcard captures everything after the matched prefix and appends it to the upstream base URL.
+
+## Host-based routing to multiple upstreams
+
+Use `.host()` on a router to match by the incoming `Host` header. This lets a single Salvo instance act as a reverse proxy for several backends on one port.
+
+```rust
+use salvo::prelude::*;
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt().init();
+
+    // Requests arriving at 127.0.0.1:8698 are forwarded to docs.rs.
+    // Requests arriving at localhost:8698 are forwarded to crates.io.
+    let router = Router::new()
+        .push(
+            Router::new()
+                .host("127.0.0.1")
+                .path("{**rest}")
+                .goal(Proxy::use_hyper_client("https://docs.rs")),
+        )
+        .push(
+            Router::new()
+                .host("localhost")
+                .path("{**rest}")
+                .goal(Proxy::use_hyper_client("https://crates.io")),
+        );
+
+    let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
+    Server::new(acceptor).serve(router).await;
+}
+```
+
+<Note>
+`.host()` matches the `Host` header value. In local testing, `127.0.0.1` and `localhost` resolve to the same address but produce different `Host` headers, making them easy to test without DNS changes.
+</Note>
+
+## Path prefix stripping
+
+When you want to expose an upstream service under a sub-path but strip that prefix before forwarding, place the prefix in the router path and use `{**rest}` to capture what follows:
+
+```rust
+// Incoming: /api/v1/users
+// Forwarded to upstream as: /users
+let router = Router::with_path("api/v1/{**rest}")
+    .goal(Proxy::use_hyper_client("https://internal-api.example.com"));
+```
+
+The proxy appends the value captured by `{**rest}` to the upstream base URL, effectively stripping `/api/v1` from every forwarded request.
+
+## Custom HTTP client configuration
+
+`Proxy::use_hyper_client` is the zero-configuration option. For production use cases that require connection pooling tuning, custom timeouts, or additional headers, build a `reqwest::Client` and pass it to `Proxy::new`:
+
+```rust
+use salvo::proxy::Proxy;
+use salvo::prelude::*;
+
+#[tokio::main]
+async fn main() {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .pool_max_idle_per_host(20)
+        .build()
+        .expect("failed to build HTTP client");
+
+    let router = Router::new()
+        .path("{**rest}")
+        .goal(Proxy::new("https://api.example.com", client));
+
+    let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
+    Server::new(acceptor).serve(router).await;
+}
+```
+
+<Tip>
+For high-traffic proxies, increase `pool_max_idle_per_host` and disable automatic cookie storage (`cookie_store(false)`) on the underlying `reqwest::Client` to reduce per-request overhead.
+</Tip>
+
+## Combining the proxy with other middleware
+
+The proxy handler is just a regular Salvo handler. You can wrap it in a router that also applies authentication, rate limiting, or logging middleware via `.hoop()`:
+
+```rust
+let proxy_route = Router::new()
+    .hoop(auth_middleware)
+    .path("{**rest}")
+    .goal(Proxy::use_hyper_client("https://protected-backend.example.com"));
+```

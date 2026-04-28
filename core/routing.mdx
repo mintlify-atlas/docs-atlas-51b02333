@@ -1,0 +1,276 @@
+---
+title: "Routing in Salvo: tree-based URL matching"
+description: "Understand Salvo's tree-based Router: path params with regex, wildcard routes, HTTP method filters, nested routes, and per-branch middleware scoping."
+---
+
+Salvo uses a tree-structured router where each node in the tree can have path filters, method filters, middleware, and a terminal handler. Incoming requests walk the tree from the root; when every filter on a node passes and the path is fully consumed, the node's handler (together with all accumulated middleware from parent nodes) runs.
+
+## Basic routes and HTTP methods
+
+`Router::new()` creates a root node. Chain method calls to add HTTP-method-specific handlers:
+
+```rust
+use salvo::prelude::*;
+
+#[handler]
+async fn index(res: &mut Response) {
+    res.render(Text::Plain("Hello World!"));
+}
+
+#[handler]
+async fn create_user(res: &mut Response) {
+    res.render(Text::Plain("user created"));
+}
+
+#[handler]
+async fn update_user(res: &mut Response) {
+    res.render(Text::Plain("user updated"));
+}
+
+#[handler]
+async fn delete_user(res: &mut Response) {
+    res.render(Text::Plain("user deleted"));
+}
+
+#[tokio::main]
+async fn main() {
+    let router = Router::new()
+        .get(index)
+        .push(
+            Router::with_path("users")
+                .post(create_user)
+                .push(
+                    Router::with_path("{id}")
+                        .put(update_user)
+                        .delete(delete_user),
+                ),
+        );
+
+    let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
+    Server::new(acceptor).serve(router).await;
+}
+```
+
+Available method helpers: `.get`, `.post`, `.put`, `.delete`, `.patch`, `.head`, `.options`. Each one is shorthand for pushing a child router with a `MethodFilter` and a terminal handler.
+
+## Path parameters
+
+Surround a segment name with curly braces to capture it as a named path parameter:
+
+```rust
+use salvo::prelude::*;
+
+#[handler]
+async fn show_user(req: &mut Request, res: &mut Response) {
+    // req.param::<u64>("id") extracts and parses the captured segment
+    let id = req.param::<u64>("id").unwrap_or(0);
+    res.render(Text::Plain(format!("user {id}")));
+}
+
+#[tokio::main]
+async fn main() {
+    let router = Router::new()
+        .push(Router::with_path("users/{id}").get(show_user));
+
+    let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
+    Server::new(acceptor).serve(router).await;
+}
+```
+
+You can add a regex constraint after a `|` inside the braces. The parameter only matches when the regex succeeds:
+
+```rust
+// Only matches numeric IDs
+Router::with_path("users/{id|\\d+}").get(show_user)
+
+// Matches a UUID-shaped string
+Router::with_path("users/{id|[0-9a-z]{8}(-[0-9a-z]{4}){3}-[0-9a-z]{12}}").get(show_user)
+
+// Named sub-group — only matches "images" or "css"
+Router::with_path("assets/{sub|(images|css)}/{filename}").get(serve_asset)
+```
+
+### Typed extraction shorthand
+
+Salvo also supports a `:type` shorthand inside path segments:
+
+```rust
+// {id:num} is equivalent to {id|\d+}
+Router::with_path("users/{id:num}").get(show_user)
+```
+
+## Wildcard routes
+
+Two wildcard forms are available:
+
+| Pattern | Matches | Notes |
+|---|---|---|
+| `{**}` | Zero or more path segments | Anonymous — value is not captured |
+| `{**rest}` | Zero or more path segments | Captured under the key `rest` |
+| `{*rest}` | One or more path segments | Captured under the key `rest` (requires at least one segment) |
+
+```rust
+use salvo::prelude::*;
+
+#[handler]
+async fn catch_all(req: &mut Request, res: &mut Response) {
+    // Retrieve the wildcard match
+    let rest = req.param::<String>("rest").unwrap_or_default();
+    res.render(Text::Plain(format!("matched: {rest}")));
+}
+
+#[tokio::main]
+async fn main() {
+    let router = Router::new()
+        .push(Router::with_path("files/{**rest}").get(catch_all));
+
+    let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
+    Server::new(acceptor).serve(router).await;
+}
+```
+
+## Nested and tree routing with `.push()`
+
+`.push()` attaches a child router under the current node. Parent-level middleware is inherited by all children, but sibling branches do not share middleware:
+
+```rust
+use salvo::prelude::*;
+
+#[handler]
+async fn auth(res: &mut Response) {
+    res.render(Text::Plain("user has authed\n\n"));
+}
+
+#[handler]
+async fn list_users(res: &mut Response)  { res.render(Text::Plain("list users")); }
+#[handler]
+async fn show_user(res: &mut Response)   { res.render(Text::Plain("show user")); }
+#[handler]
+async fn create_user(res: &mut Response) { res.render(Text::Plain("user created")); }
+#[handler]
+async fn update_user(res: &mut Response) { res.render(Text::Plain("user updated")); }
+#[handler]
+async fn delete_user(res: &mut Response) { res.render(Text::Plain("user deleted")); }
+
+#[tokio::main]
+async fn main() {
+    let router = Router::new()
+        // Write branch: auth middleware applies to POST/PUT/DELETE
+        .push(
+            Router::with_path("users")
+                .hoop(auth)
+                .post(create_user)
+                .push(
+                    Router::with_path("{id:num}")
+                        .put(update_user)
+                        .delete(delete_user),
+                ),
+        )
+        // Read branch: no auth required
+        .push(
+            Router::with_path("users")
+                .get(list_users)
+                .push(Router::with_path("{id:num}").get(show_user)),
+        );
+
+    let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
+    Server::new(acceptor).serve(router).await;
+}
+```
+
+Note how the same `/users` path prefix appears twice — Salvo tries each sibling in order, so both branches are reachable.
+
+## Conditional route construction with `.then()`
+
+`.then()` accepts a closure that receives the router and returns a (possibly modified) router. This is useful for conditionally adding routes at startup:
+
+```rust
+let debug_mode = true;
+let admin_mode = true;
+
+let router = Router::new()
+    .get(index)
+    .then(|r| {
+        if debug_mode {
+            r.push(Router::with_path("debug").get(debug_handler))
+        } else {
+            r
+        }
+    })
+    .then(|r| {
+        if admin_mode {
+            r.push(Router::with_path("admin").get(admin_handler))
+        } else {
+            r
+        }
+    });
+```
+
+## Filters
+
+### Host and scheme filters
+
+Restrict a router to a specific virtual host or URL scheme:
+
+```rust
+// Only matches requests for api.example.com
+let api_router = Router::with_host("api.example.com")
+    .push(Router::with_path("v1/users").get(list_users));
+
+// Only matches HTTPS requests
+let secure_router = Router::new()
+    .scheme(salvo::http::uri::Scheme::HTTPS)
+    .push(Router::with_path("secure").get(secure_handler));
+```
+
+### Function-based filters
+
+Use `.filter_fn()` for arbitrary matching logic:
+
+```rust
+use salvo::routing::PathState;
+
+let router = Router::new()
+    .filter_fn(|req: &mut Request, _state: &mut PathState| {
+        req.headers()
+            .get("x-internal")
+            .is_some()
+    })
+    .get(internal_handler);
+```
+
+## Using `FlowCtrl` in handlers
+
+Handlers receive a `&mut FlowCtrl` that controls whether subsequent handlers in the chain run:
+
+```rust
+use salvo::prelude::*;
+
+#[handler]
+async fn require_auth(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+    ctrl: &mut FlowCtrl,
+) {
+    let token: Option<String> = req.header("authorization");
+    if token.is_none() {
+        res.status_code(StatusCode::UNAUTHORIZED);
+        ctrl.skip_rest(); // stop — do not call the downstream handler
+    } else {
+        ctrl.call_next(req, depot, res).await; // proceed
+    }
+}
+```
+
+`ctrl.skip_rest()` prevents any further handlers from running for this request. When the response already has an error or redirect status code, Salvo skips the rest automatically.
+
+<Tip>
+Print the router tree at startup to verify your routing structure:
+
+```rust
+println!("{router:#?}");
+```
+
+The debug output shows each path segment, active filters (in brackets), and the handler type name at each leaf. This is invaluable for diagnosing unexpected 404s.
+</Tip>

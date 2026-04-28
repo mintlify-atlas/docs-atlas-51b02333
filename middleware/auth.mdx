@@ -1,0 +1,290 @@
+---
+title: "Authentication middleware in Salvo"
+description: "Add JWT and Basic Auth to Salvo routes with the jwt-auth and basic-auth features. Covers ConstDecoder, token finders, JwtAuthState, and BasicAuthValidator."
+---
+
+Salvo ships two authentication middlewares out of the box: a full JWT pipeline with configurable token finders and a lightweight HTTP Basic Auth layer backed by a custom validator trait. Both integrate with the `Depot` type-map so downstream handlers can read auth state without touching HTTP headers directly.
+
+## JWT Authentication
+
+Enable the feature flag in `Cargo.toml`:
+
+```toml
+[dependencies]
+salvo = { version = "*", features = ["jwt-auth"] }
+jsonwebtoken = "9"
+serde = { version = "1", features = ["derive"] }
+time = "0.3"
+```
+
+### How it works
+
+<Steps>
+  <Step title="Define your claims type">
+    Create a struct that represents the JWT payload. It must implement `serde::Deserialize`.
+
+    ```rust
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize, Clone, Debug)]
+    pub struct JwtClaims {
+        username: String,
+        exp: i64,
+    }
+    ```
+  </Step>
+
+  <Step title="Build the JwtAuth handler">
+    Construct a `JwtAuth` with a `ConstDecoder` (shared-secret HMAC) and one or more token finders. The default finder is `HeaderFinder`, which reads `Authorization: Bearer <token>`.
+
+    ```rust
+    use salvo::jwt_auth::{ConstDecoder, HeaderFinder, QueryFinder, CookieFinder};
+    use salvo::prelude::*;
+
+    let auth_handler: JwtAuth<JwtClaims, _> =
+        JwtAuth::new(ConstDecoder::from_secret(SECRET_KEY.as_bytes()))
+            .finders(vec![
+                Box::new(HeaderFinder::new()),          // Authorization: Bearer …
+                // Box::new(QueryFinder::new("jwt_token")),  // ?jwt_token=…
+                // Box::new(CookieFinder::new("jwt_token")), // Cookie: jwt_token=…
+            ])
+            .force_passed(true); // let the handler decide, don't auto-reject
+    ```
+
+    | Finder | Source | Notes |
+    |--------|--------|-------|
+    | `HeaderFinder` | `Authorization` / `Proxy-Authorization` header | Recommended |
+    | `CookieFinder` | Named cookie | Use `HttpOnly` + `Secure` cookies |
+    | `QueryFinder` | URL query parameter | Avoid in production |
+    | `FormFinder` | POST form field | POST-only flows |
+  </Step>
+
+  <Step title="Attach to a router">
+    Use `.hoop()` or `Router::with_hoop()` to apply the middleware.
+
+    ```rust
+    let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
+    Server::new(acceptor)
+        .serve(Router::with_hoop(auth_handler).goal(index))
+        .await;
+    ```
+  </Step>
+
+  <Step title="Read auth state in handlers">
+    The middleware writes auth state into `Depot`. Read it with `JwtAuthDepotExt`:
+
+    ```rust
+    use salvo::jwt_auth::JwtAuthState;
+    use salvo::prelude::*;
+
+    #[handler]
+    async fn index(req: &mut Request, depot: &mut Depot, res: &mut Response) -> anyhow::Result<()> {
+        if req.method() == Method::POST {
+            // ... issue a token on login ...
+        } else {
+            match depot.jwt_auth_state() {
+                JwtAuthState::Authorized => {
+                    let data = depot.jwt_auth_data::<JwtClaims>().unwrap();
+                    res.render(Text::Plain(format!(
+                        "Hi {}, have logged in successfully!",
+                        data.claims.username
+                    )));
+                }
+                JwtAuthState::Unauthorized => {
+                    res.render(Text::Html(LOGIN_HTML));
+                }
+                JwtAuthState::Forbidden => {
+                    res.render(StatusError::forbidden());
+                }
+            }
+        }
+        Ok(())
+    }
+    ```
+
+    | State | Meaning |
+    |-------|---------|
+    | `Authorized` | Token present and valid |
+    | `Unauthorized` | No token found in the request |
+    | `Forbidden` | Token found but failed validation |
+  </Step>
+</Steps>
+
+### Token issuance
+
+Encode a token with the `jsonwebtoken` crate and redirect the client:
+
+```rust
+use jsonwebtoken::EncodingKey;
+use time::{Duration, OffsetDateTime};
+
+let exp = OffsetDateTime::now_utc() + Duration::days(14);
+let claim = JwtClaims { username, exp: exp.unix_timestamp() };
+
+let token = jsonwebtoken::encode(
+    &jsonwebtoken::Header::default(),
+    &claim,
+    &EncodingKey::from_secret(SECRET_KEY.as_bytes()),
+)?;
+res.render(Redirect::other(format!("/?jwt_token={token}")));
+```
+
+### Full example
+
+```rust
+use jsonwebtoken::{self, EncodingKey};
+use salvo::http::{Method, StatusError};
+use salvo::jwt_auth::{ConstDecoder, QueryFinder};
+use salvo::prelude::*;
+use serde::{Deserialize, Serialize};
+use time::{Duration, OffsetDateTime};
+
+const SECRET_KEY: &str = "YOUR SECRET_KEY";
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct JwtClaims {
+    username: String,
+    exp: i64,
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt().init();
+
+    let auth_handler: JwtAuth<JwtClaims, _> =
+        JwtAuth::new(ConstDecoder::from_secret(SECRET_KEY.as_bytes()))
+            .finders(vec![Box::new(QueryFinder::new("jwt_token"))])
+            .force_passed(true);
+
+    let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
+    Server::new(acceptor)
+        .serve(Router::with_hoop(auth_handler).goal(index))
+        .await;
+}
+
+#[handler]
+async fn index(req: &mut Request, depot: &mut Depot, res: &mut Response) -> anyhow::Result<()> {
+    if req.method() == Method::POST {
+        let username = req.form::<String>("username").await.unwrap_or_default();
+        let password = req.form::<String>("password").await.unwrap_or_default();
+        if username != "root" || password != "pwd" {
+            res.render(Text::Html(LOGIN_HTML));
+            return Ok(());
+        }
+        let exp = OffsetDateTime::now_utc() + Duration::days(14);
+        let claim = JwtClaims { username, exp: exp.unix_timestamp() };
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &claim,
+            &EncodingKey::from_secret(SECRET_KEY.as_bytes()),
+        )?;
+        res.render(Redirect::other(format!("/?jwt_token={token}")));
+    } else {
+        match depot.jwt_auth_state() {
+            JwtAuthState::Authorized => {
+                let data = depot.jwt_auth_data::<JwtClaims>().unwrap();
+                res.render(Text::Plain(format!(
+                    "Hi {}, have logged in successfully!",
+                    data.claims.username
+                )));
+            }
+            JwtAuthState::Unauthorized => {
+                res.render(Text::Html(LOGIN_HTML));
+            }
+            JwtAuthState::Forbidden => {
+                res.render(StatusError::forbidden());
+            }
+        }
+    }
+    Ok(())
+}
+
+static LOGIN_HTML: &str = r#"<!DOCTYPE html>
+<html><head><title>JWT Auth Demo</title></head>
+<body>
+  <h1>JWT Auth</h1>
+  <form action="/" method="post">
+    <input type="text" name="username" placeholder="Username" required>
+    <input type="password" name="password" placeholder="Password" required>
+    <button type="submit">Login</button>
+  </form>
+</body></html>"#;
+```
+
+<Warning>
+Avoid putting JWT tokens in URL query parameters in production. URLs are saved in browser history, server logs, and can leak via the `Referer` header. Prefer `HeaderFinder` with `Authorization: Bearer <token>` or `CookieFinder` with `HttpOnly` and `Secure` cookie flags.
+</Warning>
+
+---
+
+## Basic Auth
+
+Enable the feature flag:
+
+```toml
+[dependencies]
+salvo = { version = "*", features = ["basic-auth"] }
+```
+
+### Implementing `BasicAuthValidator`
+
+Implement the `BasicAuthValidator` trait to plug in your credential-checking logic:
+
+```rust
+use salvo::basic_auth::{BasicAuth, BasicAuthValidator};
+use salvo::prelude::*;
+
+struct Validator;
+
+impl BasicAuthValidator for Validator {
+    async fn validate(&self, username: &str, password: &str, _depot: &mut Depot) -> bool {
+        username == "root" && password == "pwd"
+    }
+}
+```
+
+### Attaching the middleware
+
+```rust
+fn route() -> Router {
+    let auth_handler = BasicAuth::new(Validator);
+    Router::with_hoop(auth_handler).goal(hello)
+}
+```
+
+### Full example
+
+```rust
+use salvo::basic_auth::{BasicAuth, BasicAuthValidator};
+use salvo::prelude::*;
+
+struct Validator;
+
+impl BasicAuthValidator for Validator {
+    async fn validate(&self, username: &str, password: &str, _depot: &mut Depot) -> bool {
+        username == "root" && password == "pwd"
+    }
+}
+
+#[handler]
+async fn hello() -> &'static str {
+    "Hello"
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt().init();
+
+    let auth_handler = BasicAuth::new(Validator);
+    let router = Router::with_hoop(auth_handler).goal(hello);
+
+    let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
+    Server::new(acceptor).serve(router).await;
+}
+```
+
+After a successful authentication pass, the validated username is stored in the depot and can be retrieved with `depot.basic_auth_username()`.
+
+<Note>
+`BasicAuth` responds with `WWW-Authenticate: Basic realm="realm"` and `401 Unauthorized` when credentials are missing or invalid, triggering the browser's built-in login dialog.
+</Note>
